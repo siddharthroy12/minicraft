@@ -17,6 +17,9 @@ _deps/
 *.swp
 *.swo
 
+# Save files
+saves/
+
 # macOS
 .DS_Store
 

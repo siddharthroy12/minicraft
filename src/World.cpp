@@ -2,14 +2,17 @@
 #include "Textures.h"
 #include <cmath>
 #include <algorithm>
+#include <cstdio>
+#include <cstring>
+#include <ctime>
 
-static unsigned int HashCoord(int x, int y) {
-    unsigned int h = (unsigned int)(x * 374761393 + y * 668265263);
+static unsigned int HashCoord(int x, int y, unsigned int seed) {
+    unsigned int h = (unsigned int)(x * 374761393 + y * 668265263 + seed);
     h = (h ^ (h >> 13)) * 1274126177;
     return h;
 }
 
-static float ValueNoise(float x, float y) {
+static float ValueNoise(float x, float y, unsigned int seed) {
     int ix = (int)floorf(x);
     int iy = (int)floorf(y);
     float fx = x - ix;
@@ -18,27 +21,28 @@ static float ValueNoise(float x, float y) {
     float ux = fx * fx * (3.0f - 2.0f * fx);
     float uy = fy * fy * (3.0f - 2.0f * fy);
 
-    float a = (HashCoord(ix, iy) & 0xffff) / 65535.0f;
-    float b = (HashCoord(ix + 1, iy) & 0xffff) / 65535.0f;
-    float c = (HashCoord(ix, iy + 1) & 0xffff) / 65535.0f;
-    float d = (HashCoord(ix + 1, iy + 1) & 0xffff) / 65535.0f;
+    float a = (HashCoord(ix, iy, seed) & 0xffff) / 65535.0f;
+    float b = (HashCoord(ix + 1, iy, seed) & 0xffff) / 65535.0f;
+    float c = (HashCoord(ix, iy + 1, seed) & 0xffff) / 65535.0f;
+    float d = (HashCoord(ix + 1, iy + 1, seed) & 0xffff) / 65535.0f;
 
     return a + (b - a) * ux + (c - a) * uy + (a - b - c + d) * ux * uy;
 }
 
-static float TerrainNoise(int x, int z) {
+static float TerrainNoise(int x, int z, unsigned int seed) {
     float sum = 0;
     float amp = 1.0f;
     float freq = 1.0f;
     for (int i = 0; i < 4; i++) {
-        sum += ValueNoise(x * freq / 64.0f, z * freq / 64.0f) * amp;
+        sum += ValueNoise(x * freq / 64.0f, z * freq / 64.0f, seed) * amp;
         amp *= 0.5f;
         freq *= 2.0f;
     }
     return sum;
 }
 
-World::World() {
+World::World(unsigned int s) : seed(s) {
+    if (seed == 0) seed = (unsigned int)time(nullptr);
     material = LoadMaterialDefault();
     UnloadTexture(material.maps[MATERIAL_MAP_DIFFUSE].texture);
     material.maps[MATERIAL_MAP_DIFFUSE].texture = LoadBlockAtlas();
@@ -49,6 +53,69 @@ World::~World() {
         if (chunk.hasMesh) UnloadMesh(chunk.mesh);
     }
     UnloadMaterial(material);
+}
+
+void World::Save(const char* path) const {
+    FILE* f = fopen(path, "wb");
+    if (!f) return;
+
+    const char magic[4] = {'M','I','N','I'};
+    fwrite(magic, 1, 4, f);
+    uint32_t version = 1;
+    fwrite(&version, sizeof(uint32_t), 1, f);
+    fwrite(&seed, sizeof(unsigned int), 1, f);
+    fwrite(&playerPos, sizeof(Vector3), 1, f);
+    fwrite(&playerYaw, sizeof(float), 1, f);
+    fwrite(&playerPitch, sizeof(float), 1, f);
+
+    uint32_t numChunks = (uint32_t)chunks.size();
+    fwrite(&numChunks, sizeof(uint32_t), 1, f);
+
+    for (auto& [key, chunk] : chunks) {
+        int32_t cx = key.first;
+        int32_t cz = key.second;
+        fwrite(&cx, sizeof(int32_t), 1, f);
+        fwrite(&cz, sizeof(int32_t), 1, f);
+        fwrite(chunk.blocks, sizeof(BlockType), CHUNK_SIZE * CHUNK_HEIGHT * CHUNK_SIZE, f);
+    }
+
+    fclose(f);
+}
+
+bool World::Load(const char* path) {
+    FILE* f = fopen(path, "rb");
+    if (!f) return false;
+
+    char magic[4];
+    fread(magic, 1, 4, f);
+    if (memcmp(magic, "MINI", 4) != 0) { fclose(f); return false; }
+
+    uint32_t version;
+    fread(&version, sizeof(uint32_t), 1, f);
+    if (version != 1) { fclose(f); return false; }
+
+    fread(&seed, sizeof(unsigned int), 1, f);
+    fread(&playerPos, sizeof(Vector3), 1, f);
+    fread(&playerYaw, sizeof(float), 1, f);
+    fread(&playerPitch, sizeof(float), 1, f);
+
+    uint32_t numChunks;
+    fread(&numChunks, sizeof(uint32_t), 1, f);
+
+    for (uint32_t i = 0; i < numChunks; i++) {
+        int32_t cx, cz;
+        fread(&cx, sizeof(int32_t), 1, f);
+        fread(&cz, sizeof(int32_t), 1, f);
+
+        auto key = std::make_pair((int)cx, (int)cz);
+        Chunk& chunk = chunks[key];
+        fread(chunk.blocks, sizeof(BlockType), CHUNK_SIZE * CHUNK_HEIGHT * CHUNK_SIZE, f);
+        chunk.generated = true;
+        chunk.dirty = true;
+    }
+
+    fclose(f);
+    return true;
 }
 
 Chunk* World::GetChunk(int cx, int cz) {
@@ -77,7 +144,7 @@ void World::GenerateChunk(Chunk& chunk, int cx, int cz) {
             int x = startX + lx;
             int z = startZ + lz;
 
-            float n = TerrainNoise(x, z);
+            float n = TerrainNoise(x, z, seed);
             int h = 18 + (int)((n - 0.5f) * 2.0f * 10);
             h = std::max(2, std::min(h, CHUNK_HEIGHT - 12));
 
@@ -105,7 +172,7 @@ void World::GenerateChunk(Chunk& chunk, int cx, int cz) {
             }
             if (h == 0) continue;
 
-            unsigned int treeHash = HashCoord(x * 13, z * 17);
+            unsigned int treeHash = HashCoord(x * 13, z * 17, seed);
             if ((treeHash % 1000) >= 15) continue;
 
             int trunkHeight = 4 + (treeHash >> 16) % 2;
@@ -226,4 +293,10 @@ bool World::Raycast(Vector3 origin, Vector3 dir, float maxDist, Vector3& outBrea
         prev = pos;
     }
     return false;
+}
+
+void World::SetPlayerState(Vector3 pos, float yaw, float pitch) {
+    playerPos = pos;
+    playerYaw = yaw;
+    playerPitch = pitch;
 }

@@ -3,6 +3,11 @@
 #include "World.h"
 #include <cmath>
 #include <ctime>
+#include <cstdio>
+#include <cstring>
+#include <string>
+#include <vector>
+#include <filesystem>
 
 constexpr float PLAYER_HALF_WIDTH = 0.3f;
 constexpr float PLAYER_HEIGHT = 1.8f;
@@ -13,7 +18,7 @@ constexpr float MOVE_SPEED = 5.0f;
 constexpr float MOUSE_SENSITIVITY = 0.003f;
 constexpr float REACH = 6.0f;
 
-enum class GameState { MENU, PLAYING, PAUSED };
+enum class GameState { MENU, CREATE_WORLD, LOAD_WORLD, PLAYING, PAUSED };
 
 struct Player {
     Vector3 pos{};
@@ -66,14 +71,147 @@ static bool BoxOverlapsPlayer(Player& p, Vector3 blockPos) {
     return (bx0 < px1 && bx1 > px0 && by0 < py1 && by1 > py0 && bz0 < pz1 && bz1 > pz0);
 }
 
-int main() {
-    const int screenWidth = 1280;
-    const int screenHeight = 720;
+static std::vector<std::string> ListSavedWorlds() {
+    std::vector<std::string> worlds;
+    namespace fs = std::filesystem;
+    if (fs::exists("saves") && fs::is_directory("saves")) {
+        for (auto& entry : fs::directory_iterator("saves")) {
+            if (entry.is_regular_file() && entry.path().extension() == ".world") {
+                worlds.push_back(entry.path().stem().string());
+            }
+        }
+    }
+    return worlds;
+}
 
-    InitWindow(screenWidth, screenHeight, "Minicraft");
+static void StartPlaying(World*& world, Player& player, int& spawnX, int& spawnZ, int& groundY, int& selected, bool& cursorLocked, bool& skipInput, GameState& state, const std::string& worldName, bool isLoaded) {
+    for (int dx = -2; dx <= 2; dx++)
+        for (int dz = -2; dz <= 2; dz++)
+            world->EnsureChunk(dx, dz);
+    spawnX = 0;
+    spawnZ = 0;
+    groundY = world->HeightAt(spawnX, spawnZ);
+    player = {};
+    if (isLoaded) {
+        player.pos = world->GetPlayerPos();
+        player.yaw = world->GetPlayerYaw();
+        player.pitch = world->GetPlayerPitch();
+        if (player.pos.y < -10.0f) {
+            player.pos = { (float)spawnX + 0.5f, (float)(groundY + 1), (float)spawnZ + 0.5f };
+        }
+    } else {
+        player.pos = { (float)spawnX + 0.5f, (float)(groundY + 1), (float)spawnZ + 0.5f };
+    }
+    selected = 0;
+    DisableCursor();
+    cursorLocked = false;
+    skipInput = true;
+    state = GameState::PLAYING;
+}
+
+int main() {
+    SetConfigFlags(FLAG_WINDOW_RESIZABLE);
+    InitWindow(1280, 720, "Minicraft");
     SetExitKey(KEY_NULL);
     rlDisableBackfaceCulling();
     SetRandomSeed((unsigned int)time(nullptr));
+
+    // Build pixel-perfect font from monogram bitmap JSON
+    std::map<int, std::vector<int>> glyphData;
+    {
+        FILE* f = fopen("assets/monogram-bitmap.json", "r");
+        if (f) {
+            char line[512];
+            while (fgets(line, sizeof(line), f)) {
+                char* q1 = strchr(line, '"');
+                if (!q1) continue;
+                char* q2 = strchr(q1 + 1, '"');
+                if (!q2) continue;
+                std::string key(q1 + 1, q2);
+                char* bracket = strchr(q2, '[');
+                if (!bracket) continue;
+                std::vector<int> rows;
+                char* p = bracket + 1;
+                while (*p && *p != ']') {
+                    if (isdigit(*p) || *p == '-') {
+                        rows.push_back((int)strtol(p, &p, 10));
+                    } else {
+                        p++;
+                    }
+                }
+                if (key.size() == 1 && rows.size() == 12) {
+                    glyphData[(unsigned char)key[0]] = rows;
+                }
+            }
+            fclose(f);
+        }
+    }
+
+    const int cellW = 8, cellH = 12;
+    const int glyphW = 5, glyphH = 10;
+    const int cols = 16;
+    int numGlyphs = 95; // ASCII 32..126
+    int numRows = (numGlyphs + cols - 1) / cols;
+    int atlasW = cols * cellW;
+    int atlasH = numRows * cellH;
+    Image atlasImg = GenImageColor(atlasW, atlasH, BLANK);
+    for (int ch = 32; ch <= 126; ch++) {
+        auto it = glyphData.find(ch);
+        if (it == glyphData.end()) continue;
+        int idx = ch - 32;
+        int col = idx % cols;
+        int row = idx / cols;
+        int ox = col * cellW + 1;
+        int oy = row * cellH + 1;
+        auto& data = it->second;
+        for (int y = 0; y < glyphH; y++) {
+            int rowData = data[y + 2];
+            for (int x = 0; x < glyphW; x++) {
+                if (rowData & (1 << x)) {
+                    ImageDrawPixel(&atlasImg, ox + x, oy + y, WHITE);
+                }
+            }
+        }
+    }
+
+    // Build the Font manually instead of via LoadFontFromImage: that function
+    // auto-detects glyph rectangles by scanning for the first non-key pixel,
+    // which breaks down when glyphs (e.g. space, quotes, punctuation) have
+    // blank rows/columns inside their cell. Since we already know the exact
+    // grid layout, place the glyph rects ourselves.
+    Font fonts[1];
+    Font& font = fonts[0];
+    font.baseSize = glyphH;
+    font.glyphCount = numGlyphs;
+    font.glyphPadding = 0;
+    font.texture = LoadTextureFromImage(atlasImg);
+    UnloadImage(atlasImg);
+    SetTextureFilter(font.texture, TEXTURE_FILTER_POINT);
+    font.recs = (Rectangle*)RL_MALLOC(numGlyphs * sizeof(Rectangle));
+    font.glyphs = (GlyphInfo*)RL_MALLOC(numGlyphs * sizeof(GlyphInfo));
+    for (int i = 0; i < numGlyphs; i++) {
+        int col = i % cols;
+        int row = i / cols;
+        font.recs[i] = { (float)(col * cellW + 1), (float)(row * cellH + 1), (float)glyphW, (float)glyphH };
+        font.glyphs[i] = { 0 };
+        font.glyphs[i].value = 32 + i;
+        font.glyphs[i].advanceX = cellW;
+    }
+
+    // Snap to an integer multiple of the glyph's native pixel size so every
+    // source pixel maps to a whole number of screen pixels (point filtering
+    // alone doesn't prevent uneven pixel sizes at fractional scales).
+    auto PixelPerfectSize = [&](int fontSize) -> float {
+        int scale = (int)roundf((float)fontSize / fonts[0].baseSize);
+        if (scale < 1) scale = 1;
+        return (float)(scale * fonts[0].baseSize);
+    };
+    auto DrawGUI = [&](const char* text, int x, int y, int fontSize, Color color) {
+        DrawTextEx(fonts[0], text, { (float)x, (float)y }, PixelPerfectSize(fontSize), 0.0f, color);
+    };
+    auto MeasureGUI = [&](const char* text, int fontSize) -> int {
+        return (int)MeasureTextEx(fonts[0], text, PixelPerfectSize(fontSize), 0.0f).x;
+    };
 
     GameState state = GameState::MENU;
     bool cursorLocked = false;
@@ -89,9 +227,17 @@ int main() {
     const char* hotbarNames[5] = { "Dirt", "Stone", "Wood", "Leaves", "Sand" };
     int selected = 0;
 
+    char worldNameInput[64] = "";
+    int worldNameLen = 0;
+    std::vector<std::string> savedWorlds;
+    bool worldsLoaded = false;
+    std::string currentWorldName;
+
     while (!WindowShouldClose()) {
         float dt = GetFrameTime();
         if (dt > 0.05f) dt = 0.05f;
+
+        if (IsKeyPressed(KEY_F11)) ToggleFullscreen();
 
         if (state == GameState::MENU) {
             bool skip = skipInput;
@@ -103,57 +249,218 @@ int main() {
 
             Vector2 mousePos = GetMousePosition();
             float btnW = 240, btnH = 50;
-            float btnX = screenWidth / 2.0f - btnW / 2.0f;
-            float playBtnY = screenHeight / 2.0f - 10;
-            float quitBtnY = playBtnY + 70;
-            bool mouseOverPlay = CheckCollisionPointRec(mousePos, { btnX, playBtnY, btnW, btnH });
+            float btnX = GetScreenWidth() / 2.0f - btnW / 2.0f;
+            float newBtnY = GetScreenHeight() / 2.0f - 45;
+            float loadBtnY = newBtnY + 70;
+            float quitBtnY = loadBtnY + 70;
+            bool mouseOverNew = CheckCollisionPointRec(mousePos, { btnX, newBtnY, btnW, btnH });
+            bool mouseOverLoad = CheckCollisionPointRec(mousePos, { btnX, loadBtnY, btnW, btnH });
             bool mouseOverQuit = CheckCollisionPointRec(mousePos, { btnX, quitBtnY, btnW, btnH });
 
-            bool startGame = !skip && ((mouseOverPlay && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) || IsKeyPressed(KEY_ENTER));
-            bool quitGame = !skip && (mouseOverQuit && IsMouseButtonPressed(MOUSE_BUTTON_LEFT));
-
-            if (startGame) {
-                world = new World();
-                for (int dx = -2; dx <= 2; dx++)
-                    for (int dz = -2; dz <= 2; dz++)
-                        world->EnsureChunk(dx, dz);
-                spawnX = 0;
-                spawnZ = 0;
-                groundY = world->HeightAt(spawnX, spawnZ);
-                player = {};
-                player.pos = { (float)spawnX + 0.5f, (float)(groundY + 1), (float)spawnZ + 0.5f };
-                selected = 0;
-                DisableCursor();
-                cursorLocked = false;
+            if (!skip && mouseOverNew && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+                worldNameInput[0] = '\0';
+                worldNameLen = 0;
                 skipInput = true;
-                state = GameState::PLAYING;
+                state = GameState::CREATE_WORLD;
             }
-            if (quitGame) break;
+            if (!skip && mouseOverLoad && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+                savedWorlds = ListSavedWorlds();
+                worldsLoaded = true;
+                skipInput = true;
+                state = GameState::LOAD_WORLD;
+            }
+            if (!skip && mouseOverQuit && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) break;
 
             BeginDrawing();
             ClearBackground(Color{ 30, 30, 30, 255 });
 
             const char* title = "MINICRAFT";
-            int titleSize = 60;
-            int titleWidth = MeasureText(title, titleSize);
-            DrawText(title, screenWidth / 2 - titleWidth / 2, screenHeight / 2 - 120, titleSize, WHITE);
+            int titleSize = 64;
+            int titleWidth = MeasureGUI(title, titleSize);
+            DrawGUI(title, GetScreenWidth() / 2 - titleWidth / 2, GetScreenHeight() / 2 - 150, titleSize, WHITE);
 
             const char* subtitle = "A Voxel Sandbox";
-            int subSize = 18;
-            int subWidth = MeasureText(subtitle, subSize);
-            DrawText(subtitle, screenWidth / 2 - subWidth / 2, screenHeight / 2 - 50, subSize, GRAY);
+            int subSize = 16;
+            int subWidth = MeasureGUI(subtitle, subSize);
+            DrawGUI(subtitle, GetScreenWidth() / 2 - subWidth / 2, GetScreenHeight() / 2 - 80, subSize, GRAY);
 
-            Color playBg = mouseOverPlay ? Color{ 80, 160, 80, 255 } : Color{ 60, 120, 60, 255 };
-            DrawRectangle((int)btnX, (int)playBtnY, (int)btnW, (int)btnH, playBg);
-            const char* playText = "Play";
-            int playTextW = MeasureText(playText, 24);
-            DrawText(playText, (int)(btnX + btnW / 2 - playTextW / 2), (int)(playBtnY + 13), 24, WHITE);
+            Color newBg = mouseOverNew ? Color{ 80, 160, 80, 255 } : Color{ 60, 120, 60, 255 };
+            DrawRectangle((int)btnX, (int)newBtnY, (int)btnW, (int)btnH, newBg);
+            const char* newText = "New World";
+            int newTextW = MeasureGUI(newText, 24);
+            DrawGUI(newText, (int)(btnX + btnW / 2 - newTextW / 2), (int)(newBtnY + 13), 24, WHITE);
+
+            Color loadBg = mouseOverLoad ? Color{ 80, 130, 180, 255 } : Color{ 50, 100, 150, 255 };
+            DrawRectangle((int)btnX, (int)loadBtnY, (int)btnW, (int)btnH, loadBg);
+            const char* loadText = "Load World";
+            int loadTextW = MeasureGUI(loadText, 24);
+            DrawGUI(loadText, (int)(btnX + btnW / 2 - loadTextW / 2), (int)(loadBtnY + 13), 24, WHITE);
 
             Color quitBg = mouseOverQuit ? Color{ 160, 60, 60, 255 } : Color{ 120, 50, 50, 255 };
             DrawRectangle((int)btnX, (int)quitBtnY, (int)btnW, (int)btnH, quitBg);
             const char* quitText = "Quit";
-            int quitTextW = MeasureText(quitText, 24);
-            DrawText(quitText, (int)(btnX + btnW / 2 - quitTextW / 2), (int)(quitBtnY + 13), 24, WHITE);
+            int quitTextW = MeasureGUI(quitText, 24);
+            DrawGUI(quitText, (int)(btnX + btnW / 2 - quitTextW / 2), (int)(quitBtnY + 13), 24, WHITE);
+
+            DrawFPS(10, 10);
+            EndDrawing();
+        } else if (state == GameState::CREATE_WORLD) {
+            bool skip = skipInput;
+            if (skipInput) { skipInput = false; }
+
+            if (!skip) {
+                if (IsKeyPressed(KEY_BACKSPACE) && worldNameLen > 0) {
+                    worldNameLen--;
+                    worldNameInput[worldNameLen] = '\0';
+                }
+                int ch = GetCharPressed();
+                while (ch > 0 && worldNameLen < 30) {
+                    if ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '_' || ch == ' ') {
+                        worldNameInput[worldNameLen++] = (char)ch;
+                        worldNameInput[worldNameLen] = '\0';
+                    }
+                    ch = GetCharPressed();
+                }
+            }
+
+            Vector2 mousePos = GetMousePosition();
+            float btnW = 240, btnH = 50;
+            float btnX = GetScreenWidth() / 2.0f - btnW / 2.0f;
+            float createBtnY = GetScreenHeight() / 2.0f + 40;
+            float backBtnY = createBtnY + 70;
+            bool mouseOverCreate = CheckCollisionPointRec(mousePos, { btnX, createBtnY, btnW, btnH }) && worldNameLen > 0;
+            bool mouseOverBack = CheckCollisionPointRec(mousePos, { btnX, backBtnY, btnW, btnH });
+
+            if (!skip && mouseOverCreate && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+                namespace fs = std::filesystem;
+                if (!fs::exists("saves")) fs::create_directories("saves");
+                std::string path = "saves/" + std::string(worldNameInput) + ".world";
+                currentWorldName = worldNameInput;
+                world = new World();
+                world->Save(path.c_str());
+                StartPlaying(world, player, spawnX, spawnZ, groundY, selected, cursorLocked, skipInput, state, currentWorldName, false);
+            }
+            if (!skip && mouseOverBack && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+                skipInput = true;
+                state = GameState::MENU;
+            }
+            if (!skip && IsKeyPressed(KEY_ESCAPE)) {
+                skipInput = true;
+                state = GameState::MENU;
+            }
+
+            BeginDrawing();
+            ClearBackground(Color{ 30, 30, 30, 255 });
+
+            const char* title = "NEW WORLD";
+            int titleSize = 48;
+            int titleWidth = MeasureGUI(title, titleSize);
+            DrawGUI(title, GetScreenWidth() / 2 - titleWidth / 2, GetScreenHeight() / 2 - 140, titleSize, WHITE);
+
+            const char* label = "World Name:";
+            int labelW = MeasureGUI(label, 16);
+            DrawGUI(label, GetScreenWidth() / 2 - labelW / 2, GetScreenHeight() / 2 - 70, 16, GRAY);
+
+            float inputW = 300, inputH = 40;
+            float inputX = GetScreenWidth() / 2.0f - inputW / 2.0f;
+            float inputY = GetScreenHeight() / 2.0f - 35;
+            DrawRectangle((int)inputX, (int)inputY, (int)inputW, (int)inputH, Color{ 60, 60, 60, 255 });
+            DrawRectangleLines((int)inputX, (int)inputY, (int)inputW, (int)inputH, Color{ 120, 120, 120, 255 });
+
+            const char* displayText = worldNameLen > 0 ? worldNameInput : "Enter name...";
+            Color textColor = worldNameLen > 0 ? WHITE : GRAY;
+            DrawGUI(displayText, (int)inputX + 10, (int)inputY + 10, 16, textColor);
+
+            if (((int)(GetTime() * 2.0f) % 2 == 0) && worldNameLen < 30) {
+                int textW = MeasureGUI(displayText, 16);
+                DrawGUI("_", (int)inputX + 10 + textW + 2, (int)inputY + 10, 16, WHITE);
+            }
+
+            Color createBg = mouseOverCreate ? Color{ 80, 160, 80, 255 } : Color{ 60, 120, 60, 255 };
+            if (worldNameLen == 0) createBg = Color{ 40, 40, 40, 255 };
+            DrawRectangle((int)btnX, (int)createBtnY, (int)btnW, (int)btnH, createBg);
+            const char* createText = "Create";
+            int createTextW = MeasureGUI(createText, 24);
+            DrawGUI(createText, (int)(btnX + btnW / 2 - createTextW / 2), (int)(createBtnY + 13), 24, worldNameLen > 0 ? WHITE : GRAY);
+
+            Color backBg = mouseOverBack ? Color{ 100, 100, 100, 255 } : Color{ 70, 70, 70, 255 };
+            DrawRectangle((int)btnX, (int)backBtnY, (int)btnW, (int)btnH, backBg);
+            const char* backText = "Back";
+            int backTextW = MeasureGUI(backText, 24);
+            DrawGUI(backText, (int)(btnX + btnW / 2 - backTextW / 2), (int)(backBtnY + 13), 24, WHITE);
+
+            DrawFPS(10, 10);
+            EndDrawing();
+        } else if (state == GameState::LOAD_WORLD) {
+            bool skip = skipInput;
+            if (skipInput) { skipInput = false; }
+
+            Vector2 mousePos = GetMousePosition();
+            float btnW = 240, btnH = 50;
+            float btnX = GetScreenWidth() / 2.0f - btnW / 2.0f;
+            float backBtnY = GetScreenHeight() - 80;
+
+            if (!skip && IsKeyPressed(KEY_ESCAPE)) {
+                skipInput = true;
+                state = GameState::MENU;
+            }
+
+            bool clickedWorld = false;
+            if (!skip && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+                for (int i = 0; i < (int)savedWorlds.size(); i++) {
+                    float entryY = 120 + i * 55;
+                    if (entryY + 45 > backBtnY - 10) break;
+                    if (CheckCollisionPointRec(mousePos, { btnX, entryY, btnW, 45 })) {
+                        namespace fs = std::filesystem;
+                        std::string path = "saves/" + savedWorlds[i] + ".world";
+                        currentWorldName = savedWorlds[i];
+                        world = new World();
+                        if (world->Load(path.c_str())) {
+                            StartPlaying(world, player, spawnX, spawnZ, groundY, selected, cursorLocked, skipInput, state, currentWorldName, true);
+                            clickedWorld = true;
+                        } else {
+                            delete world;
+                            world = nullptr;
+                        }
+                        break;
+                    }
+                }
+            }
+
+            bool mouseOverBack = CheckCollisionPointRec(mousePos, { btnX, backBtnY, btnW, btnH });
+            if (!skip && !clickedWorld && mouseOverBack && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+                skipInput = true;
+                state = GameState::MENU;
+            }
+
+            BeginDrawing();
+            ClearBackground(Color{ 30, 30, 30, 255 });
+
+            const char* title = "LOAD WORLD";
+            int titleSize = 48;
+            int titleWidth = MeasureGUI(title, titleSize);
+            DrawGUI(title, GetScreenWidth() / 2 - titleWidth / 2, 40, titleSize, WHITE);
+
+            if (savedWorlds.empty()) {
+                const char* emptyMsg = "No saved worlds found";
+                int emptyW = MeasureGUI(emptyMsg, 16);
+                DrawGUI(emptyMsg, GetScreenWidth() / 2 - emptyW / 2, GetScreenHeight() / 2 - 10, 16, GRAY);
+            } else {
+                for (int i = 0; i < (int)savedWorlds.size(); i++) {
+                    float entryY = 120 + i * 55;
+                    if (entryY + 45 > backBtnY - 10) break;
+                    bool mouseOver = CheckCollisionPointRec(mousePos, { btnX, entryY, btnW, 45 });
+                    Color entryBg = mouseOver ? Color{ 70, 110, 160, 255 } : Color{ 50, 50, 60, 255 };
+                    DrawRectangle((int)btnX, (int)entryY, (int)btnW, 45, entryBg);
+                    DrawGUI(savedWorlds[i].c_str(), (int)btnX + 15, (int)entryY + 12, 16, WHITE);
+                }
+            }
+
+            Color backBg = mouseOverBack ? Color{ 100, 100, 100, 255 } : Color{ 70, 70, 70, 255 };
+            DrawRectangle((int)btnX, (int)backBtnY, (int)btnW, (int)btnH, backBg);
+            const char* backText = "Back";
+            int backTextW = MeasureGUI(backText, 24);
+            DrawGUI(backText, (int)(btnX + btnW / 2 - backTextW / 2), (int)(backBtnY + 13), 24, WHITE);
 
             DrawFPS(10, 10);
             EndDrawing();
@@ -249,12 +556,12 @@ int main() {
             }
             EndMode3D();
 
-            DrawLine(screenWidth / 2 - 8, screenHeight / 2, screenWidth / 2 + 8, screenHeight / 2, WHITE);
-            DrawLine(screenWidth / 2, screenHeight / 2 - 8, screenWidth / 2, screenHeight / 2 + 8, WHITE);
+            DrawLine(GetScreenWidth() / 2 - 8, GetScreenHeight() / 2, GetScreenWidth() / 2 + 8, GetScreenHeight() / 2, WHITE);
+            DrawLine(GetScreenWidth() / 2, GetScreenHeight() / 2 - 8, GetScreenWidth() / 2, GetScreenHeight() / 2 + 8, WHITE);
 
             for (int k = 0; k < 5; k++) {
                 Color c = (k == selected) ? YELLOW : WHITE;
-                DrawText(TextFormat("%d:%s", k + 1, hotbarNames[k]), 10 + k * 130, screenHeight - 30, 20, c);
+                DrawGUI(TextFormat("%d:%s", k + 1, hotbarNames[k]), 10 + k * 130, GetScreenHeight() - 30, 16, c);
             }
             DrawFPS(10, 10);
 
@@ -264,16 +571,31 @@ int main() {
             if (skipInput) { skipInput = false; }
             Vector2 mousePos = GetMousePosition();
             float btnW = 240, btnH = 50;
-            float btnX = screenWidth / 2.0f - btnW / 2.0f;
-            float resumeBtnY = screenHeight / 2.0f - 10;
-            float menuBtnY = resumeBtnY + 70;
+            float btnX = GetScreenWidth() / 2.0f - btnW / 2.0f;
+            float resumeBtnY = GetScreenHeight() / 2.0f - 45;
+            float saveQuitBtnY = resumeBtnY + 70;
+            float menuBtnY = saveQuitBtnY + 70;
             bool mouseOverResume = CheckCollisionPointRec(mousePos, { btnX, resumeBtnY, btnW, btnH });
+            bool mouseOverSaveQuit = CheckCollisionPointRec(mousePos, { btnX, saveQuitBtnY, btnW, btnH });
             bool mouseOverMenu = CheckCollisionPointRec(mousePos, { btnX, menuBtnY, btnW, btnH });
 
             if (!skip && mouseOverResume && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
                 DisableCursor();
                 skipInput = true;
                 state = GameState::PLAYING;
+            }
+            if (!skip && mouseOverSaveQuit && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+                namespace fs = std::filesystem;
+                if (!fs::exists("saves")) fs::create_directories("saves");
+                std::string path = "saves/" + currentWorldName + ".world";
+                world->SetPlayerState(player.pos, player.yaw, player.pitch);
+                world->Save(path.c_str());
+                cursorLocked = true;
+                delete world;
+                world = nullptr;
+                skipInput = true;
+                state = GameState::MENU;
+                continue;
             }
             if (!skip && mouseOverMenu && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
                 cursorLocked = true;
@@ -304,24 +626,30 @@ int main() {
             world->Render(eye, RENDER_DISTANCE * CHUNK_SIZE);
             EndMode3D();
 
-            DrawRectangle(0, 0, screenWidth, screenHeight, Color{ 0, 0, 0, 140 });
+            DrawRectangle(0, 0, GetScreenWidth(), GetScreenHeight(), Color{ 0, 0, 0, 140 });
 
             const char* pauseTitle = "PAUSED";
-            int pauseTitleSize = 50;
-            int pauseTitleW = MeasureText(pauseTitle, pauseTitleSize);
-            DrawText(pauseTitle, screenWidth / 2 - pauseTitleW / 2, screenHeight / 2 - 110, pauseTitleSize, WHITE);
+            int pauseTitleSize = 48;
+            int pauseTitleW = MeasureGUI(pauseTitle, pauseTitleSize);
+            DrawGUI(pauseTitle, GetScreenWidth() / 2 - pauseTitleW / 2, GetScreenHeight() / 2 - 130, pauseTitleSize, WHITE);
 
             Color resumeBg = mouseOverResume ? Color{ 80, 160, 80, 255 } : Color{ 60, 120, 60, 255 };
             DrawRectangle((int)btnX, (int)resumeBtnY, (int)btnW, (int)btnH, resumeBg);
             const char* resumeText = "Resume";
-            int resumeTextW = MeasureText(resumeText, 24);
-            DrawText(resumeText, (int)(btnX + btnW / 2 - resumeTextW / 2), (int)(resumeBtnY + 13), 24, WHITE);
+            int resumeTextW = MeasureGUI(resumeText, 24);
+            DrawGUI(resumeText, (int)(btnX + btnW / 2 - resumeTextW / 2), (int)(resumeBtnY + 13), 24, WHITE);
+
+            Color saveQuitBg = mouseOverSaveQuit ? Color{ 80, 130, 180, 255 } : Color{ 50, 100, 150, 255 };
+            DrawRectangle((int)btnX, (int)saveQuitBtnY, (int)btnW, (int)btnH, saveQuitBg);
+            const char* saveQuitText = "Save & Quit";
+            int saveQuitTextW = MeasureGUI(saveQuitText, 24);
+            DrawGUI(saveQuitText, (int)(btnX + btnW / 2 - saveQuitTextW / 2), (int)(saveQuitBtnY + 13), 24, WHITE);
 
             Color menuBg = mouseOverMenu ? Color{ 160, 60, 60, 255 } : Color{ 120, 50, 50, 255 };
             DrawRectangle((int)btnX, (int)menuBtnY, (int)btnW, (int)btnH, menuBg);
             const char* menuText = "Quit to Menu";
-            int menuTextW = MeasureText(menuText, 24);
-            DrawText(menuText, (int)(btnX + btnW / 2 - menuTextW / 2), (int)(menuBtnY + 13), 24, WHITE);
+            int menuTextW = MeasureGUI(menuText, 24);
+            DrawGUI(menuText, (int)(btnX + btnW / 2 - menuTextW / 2), (int)(menuBtnY + 13), 24, WHITE);
 
             DrawFPS(10, 10);
             EndDrawing();
@@ -329,6 +657,7 @@ int main() {
     }
 
     delete world;
+    UnloadFont(fonts[0]);
     CloseWindow();
     return 0;
 }
