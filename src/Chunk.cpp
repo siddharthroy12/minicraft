@@ -70,7 +70,7 @@ void BuildChunkMesh(World& world, int cx, int cz, Chunk& chunk) {
         int x = startX + lx;
         for (int lz = 0; lz < CHUNK_SIZE; lz++) {
             int z = startZ + lz;
-            for (int y = 0; y < WORLD_HEIGHT; y++) {
+            for (int y = 0; y < CHUNK_HEIGHT; y++) {
                 BlockType t = world.GetBlock(x, y, z);
                 if (t == BlockType::Air) continue;
 

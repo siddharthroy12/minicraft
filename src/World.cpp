@@ -3,110 +3,129 @@
 #include <cmath>
 #include <algorithm>
 
+static unsigned int HashCoord(int x, int y) {
+    unsigned int h = (unsigned int)(x * 374761393 + y * 668265263);
+    h = (h ^ (h >> 13)) * 1274126177;
+    return h;
+}
+
+static float ValueNoise(float x, float y) {
+    int ix = (int)floorf(x);
+    int iy = (int)floorf(y);
+    float fx = x - ix;
+    float fy = y - iy;
+
+    float ux = fx * fx * (3.0f - 2.0f * fx);
+    float uy = fy * fy * (3.0f - 2.0f * fy);
+
+    float a = (HashCoord(ix, iy) & 0xffff) / 65535.0f;
+    float b = (HashCoord(ix + 1, iy) & 0xffff) / 65535.0f;
+    float c = (HashCoord(ix, iy + 1) & 0xffff) / 65535.0f;
+    float d = (HashCoord(ix + 1, iy + 1) & 0xffff) / 65535.0f;
+
+    return a + (b - a) * ux + (c - a) * uy + (a - b - c + d) * ux * uy;
+}
+
+static float TerrainNoise(int x, int z) {
+    float sum = 0;
+    float amp = 1.0f;
+    float freq = 1.0f;
+    for (int i = 0; i < 4; i++) {
+        sum += ValueNoise(x * freq / 64.0f, z * freq / 64.0f) * amp;
+        amp *= 0.5f;
+        freq *= 2.0f;
+    }
+    return sum;
+}
+
 World::World() {
-    blocks.assign((size_t)WORLD_SIZE_X * WORLD_HEIGHT * WORLD_SIZE_Z, BlockType::Air);
-    chunks.resize((size_t)CHUNKS_X * CHUNKS_Z);
     material = LoadMaterialDefault();
     UnloadTexture(material.maps[MATERIAL_MAP_DIFFUSE].texture);
     material.maps[MATERIAL_MAP_DIFFUSE].texture = LoadBlockAtlas();
 }
 
 World::~World() {
-    for (auto& c : chunks) {
-        if (c.hasMesh) UnloadMesh(c.mesh);
+    for (auto& [key, chunk] : chunks) {
+        if (chunk.hasMesh) UnloadMesh(chunk.mesh);
     }
     UnloadMaterial(material);
 }
 
-bool World::InBounds(int x, int y, int z) const {
-    return x >= 0 && x < WORLD_SIZE_X && y >= 0 && y < WORLD_HEIGHT && z >= 0 && z < WORLD_SIZE_Z;
+Chunk* World::GetChunk(int cx, int cz) {
+    auto it = chunks.find({cx, cz});
+    return (it != chunks.end()) ? &it->second : nullptr;
 }
 
-BlockType World::GetBlock(int x, int y, int z) const {
-    if (!InBounds(x, y, z)) return BlockType::Air;
-    return blocks[Index(x, y, z)];
+const Chunk* World::GetChunk(int cx, int cz) const {
+    auto it = chunks.find({cx, cz});
+    return (it != chunks.end()) ? &it->second : nullptr;
 }
 
-bool World::IsSolid(int x, int y, int z) const {
-    return GetBlock(x, y, z) != BlockType::Air;
-}
-
-void World::SetBlock(int x, int y, int z, BlockType type) {
-    if (!InBounds(x, y, z)) return;
-    blocks[Index(x, y, z)] = type;
-    MarkDirty(x, y, z);
-}
-
-void World::MarkDirty(int x, int y, int z) {
-    int cx = x / CHUNK_SIZE;
-    int cz = z / CHUNK_SIZE;
-    auto mark = [&](int ccx, int ccz) {
-        if (ccx >= 0 && ccx < CHUNKS_X && ccz >= 0 && ccz < CHUNKS_Z) {
-            chunks[ccz * CHUNKS_X + ccx].dirty = true;
-        }
-    };
-    mark(cx, cz);
-    int lx = x % CHUNK_SIZE;
-    int lz = z % CHUNK_SIZE;
-    if (lx == 0) mark(cx - 1, cz);
-    if (lx == CHUNK_SIZE - 1) mark(cx + 1, cz);
-    if (lz == 0) mark(cx, cz - 1);
-    if (lz == CHUNK_SIZE - 1) mark(cx, cz + 1);
-}
-
-int World::HeightAt(int x, int z) const {
-    for (int y = WORLD_HEIGHT - 1; y >= 0; y--) {
-        if (GetBlock(x, y, z) != BlockType::Air) return y;
+void World::EnsureChunk(int cx, int cz) {
+    auto key = std::make_pair(cx, cz);
+    if (chunks.find(key) == chunks.end()) {
+        GenerateChunk(chunks[key], cx, cz);
     }
-    return 0;
 }
 
-void World::Generate() {
-    Image noise = GenImagePerlinNoise(WORLD_SIZE_X, WORLD_SIZE_Z, 0, 0, 3.0f);
-    Color* pixels = LoadImageColors(noise);
+void World::GenerateChunk(Chunk& chunk, int cx, int cz) {
+    int startX = cx * CHUNK_SIZE;
+    int startZ = cz * CHUNK_SIZE;
 
-    const int baseHeight = 18;
-    const int variation = 10;
+    for (int lx = 0; lx < CHUNK_SIZE; lx++) {
+        for (int lz = 0; lz < CHUNK_SIZE; lz++) {
+            int x = startX + lx;
+            int z = startZ + lz;
 
-    for (int x = 0; x < WORLD_SIZE_X; x++) {
-        for (int z = 0; z < WORLD_SIZE_Z; z++) {
-            float n = pixels[z * WORLD_SIZE_X + x].r / 255.0f;
-            int h = baseHeight + (int)((n - 0.5f) * 2.0f * variation);
-            h = std::max(2, std::min(h, WORLD_HEIGHT - 12));
+            float n = TerrainNoise(x, z);
+            int h = 18 + (int)((n - 0.5f) * 2.0f * 10);
+            h = std::max(2, std::min(h, CHUNK_HEIGHT - 12));
+
             for (int y = 0; y <= h; y++) {
                 BlockType t;
                 if (y == h) t = BlockType::Grass;
                 else if (y >= h - 3) t = BlockType::Dirt;
                 else t = BlockType::Stone;
-                blocks[Index(x, y, z)] = t;
+                chunk.blocks[chunk.Index(lx, y, lz)] = t;
             }
         }
     }
 
-    UnloadImageColors(pixels);
-    UnloadImage(noise);
+    for (int lx = 2; lx < CHUNK_SIZE - 2; lx++) {
+        for (int lz = 2; lz < CHUNK_SIZE - 2; lz++) {
+            int x = startX + lx;
+            int z = startZ + lz;
 
-    for (int x = 3; x < WORLD_SIZE_X - 3; x++) {
-        for (int z = 3; z < WORLD_SIZE_Z - 3; z++) {
-            int h = HeightAt(x, z);
-            if (blocks[Index(x, h, z)] != BlockType::Grass) continue;
-            if (GetRandomValue(0, 999) >= 15) continue;
-
-            int trunkHeight = GetRandomValue(4, 5);
-            for (int ty = 1; ty <= trunkHeight; ty++) {
-                blocks[Index(x, h + ty, z)] = BlockType::Wood;
+            int h = 0;
+            for (int y = CHUNK_HEIGHT - 1; y >= 0; y--) {
+                if (chunk.blocks[chunk.Index(lx, y, lz)] == BlockType::Grass) {
+                    h = y;
+                    break;
+                }
             }
+            if (h == 0) continue;
+
+            unsigned int treeHash = HashCoord(x * 13, z * 17);
+            if ((treeHash % 1000) >= 15) continue;
+
+            int trunkHeight = 4 + (treeHash >> 16) % 2;
+            for (int ty = 1; ty <= trunkHeight; ty++) {
+                if (h + ty < CHUNK_HEIGHT)
+                    chunk.blocks[chunk.Index(lx, h + ty, lz)] = BlockType::Wood;
+            }
+
             int trunkTop = h + trunkHeight;
             for (int ly = 0; ly <= 2; ly++) {
                 int ry = trunkTop - 2 + ly;
                 int radius = (ly == 2) ? 1 : 2;
                 for (int dx = -radius; dx <= radius; dx++) {
                     for (int dz = -radius; dz <= radius; dz++) {
-                        if (radius == 2 && std::abs(dx) == 2 && std::abs(dz) == 2) continue;
-                        int bx = x + dx, bz = z + dz;
-                        if (!InBounds(bx, ry, bz)) continue;
-                        if (blocks[Index(bx, ry, bz)] == BlockType::Air) {
-                            blocks[Index(bx, ry, bz)] = BlockType::Leaves;
+                        if (radius == 2 && abs(dx) == 2 && abs(dz) == 2) continue;
+                        int tlx = lx + dx;
+                        int tlz = lz + dz;
+                        if (tlx < 0 || tlx >= CHUNK_SIZE || tlz < 0 || tlz >= CHUNK_SIZE) continue;
+                        if (ry >= 0 && ry < CHUNK_HEIGHT && chunk.blocks[chunk.Index(tlx, ry, tlz)] == BlockType::Air) {
+                            chunk.blocks[chunk.Index(tlx, ry, tlz)] = BlockType::Leaves;
                         }
                     }
                 }
@@ -114,25 +133,79 @@ void World::Generate() {
         }
     }
 
-    for (auto& c : chunks) c.dirty = true;
-    RebuildDirtyChunks();
+    chunk.generated = true;
+    chunk.dirty = true;
 }
 
-void World::RebuildDirtyChunks() {
-    for (int cz = 0; cz < CHUNKS_Z; cz++) {
-        for (int cx = 0; cx < CHUNKS_X; cx++) {
-            Chunk& chunk = chunks[cz * CHUNKS_X + cx];
-            if (chunk.dirty) {
-                BuildChunkMesh(*this, cx, cz, chunk);
-                chunk.dirty = false;
+BlockType World::GetBlock(int x, int y, int z) const {
+    if (y < 0 || y >= CHUNK_HEIGHT) return BlockType::Air;
+    int cx = (int)floorf((float)x / CHUNK_SIZE);
+    int cz = (int)floorf((float)z / CHUNK_SIZE);
+    const Chunk* chunk = GetChunk(cx, cz);
+    if (!chunk) return BlockType::Air;
+    int lx = x - cx * CHUNK_SIZE;
+    int lz = z - cz * CHUNK_SIZE;
+    return chunk->blocks[chunk->Index(lx, y, lz)];
+}
+
+void World::SetBlock(int x, int y, int z, BlockType type) {
+    if (y < 0 || y >= CHUNK_HEIGHT) return;
+    int cx = (int)floorf((float)x / CHUNK_SIZE);
+    int cz = (int)floorf((float)z / CHUNK_SIZE);
+    Chunk* chunk = GetChunk(cx, cz);
+    if (!chunk) return;
+    int lx = x - cx * CHUNK_SIZE;
+    int lz = z - cz * CHUNK_SIZE;
+    chunk->blocks[chunk->Index(lx, y, lz)] = type;
+
+    chunk->dirty = true;
+    if (lx == 0) { Chunk* c = GetChunk(cx - 1, cz); if (c) c->dirty = true; }
+    if (lx == CHUNK_SIZE - 1) { Chunk* c = GetChunk(cx + 1, cz); if (c) c->dirty = true; }
+    if (lz == 0) { Chunk* c = GetChunk(cx, cz - 1); if (c) c->dirty = true; }
+    if (lz == CHUNK_SIZE - 1) { Chunk* c = GetChunk(cx, cz + 1); if (c) c->dirty = true; }
+}
+
+bool World::IsSolid(int x, int y, int z) const {
+    return GetBlock(x, y, z) != BlockType::Air;
+}
+
+int World::HeightAt(int x, int z) const {
+    for (int y = CHUNK_HEIGHT - 1; y >= 0; y--) {
+        if (GetBlock(x, y, z) != BlockType::Air) return y;
+    }
+    return 0;
+}
+
+void World::RebuildDirtyChunks(Vector3 center, float radius) {
+    int cx0 = (int)floorf((center.x - radius) / CHUNK_SIZE);
+    int cx1 = (int)floorf((center.x + radius) / CHUNK_SIZE);
+    int cz0 = (int)floorf((center.z - radius) / CHUNK_SIZE);
+    int cz1 = (int)floorf((center.z + radius) / CHUNK_SIZE);
+
+    for (int cz = cz0; cz <= cz1; cz++) {
+        for (int cx = cx0; cx <= cx1; cx++) {
+            Chunk* chunk = GetChunk(cx, cz);
+            if (chunk && chunk->dirty) {
+                BuildChunkMesh(*this, cx, cz, *chunk);
+                chunk->dirty = false;
             }
         }
     }
 }
 
-void World::Render() {
-    for (auto& c : chunks) {
-        if (c.hasMesh) DrawMesh(c.mesh, material, MatrixIdentity());
+void World::Render(Vector3 center, float radius) {
+    int cx0 = (int)floorf((center.x - radius) / CHUNK_SIZE);
+    int cx1 = (int)floorf((center.x + radius) / CHUNK_SIZE);
+    int cz0 = (int)floorf((center.z - radius) / CHUNK_SIZE);
+    int cz1 = (int)floorf((center.z + radius) / CHUNK_SIZE);
+
+    for (int cz = cz0; cz <= cz1; cz++) {
+        for (int cx = cx0; cx <= cx1; cx++) {
+            const Chunk* chunk = GetChunk(cx, cz);
+            if (chunk && chunk->hasMesh) {
+                DrawMesh(chunk->mesh, material, MatrixIdentity());
+            }
+        }
     }
 }
 

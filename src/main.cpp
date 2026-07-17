@@ -13,7 +13,7 @@ constexpr float MOVE_SPEED = 5.0f;
 constexpr float MOUSE_SENSITIVITY = 0.003f;
 constexpr float REACH = 6.0f;
 
-enum class GameState { MENU, PLAYING };
+enum class GameState { MENU, PLAYING, PAUSED };
 
 struct Player {
     Vector3 pos{};
@@ -71,16 +71,18 @@ int main() {
     const int screenHeight = 720;
 
     InitWindow(screenWidth, screenHeight, "Minicraft");
+    SetExitKey(KEY_NULL);
     rlDisableBackfaceCulling();
     SetRandomSeed((unsigned int)time(nullptr));
 
     GameState state = GameState::MENU;
     bool cursorLocked = false;
+    bool skipInput = false;
 
     World* world = nullptr;
     Player player{};
-    int spawnX = WORLD_SIZE_X / 2;
-    int spawnZ = WORLD_SIZE_Z / 2;
+    int spawnX = 0;
+    int spawnZ = 0;
     int groundY = 0;
 
     BlockType hotbar[5] = { BlockType::Dirt, BlockType::Stone, BlockType::Wood, BlockType::Leaves, BlockType::Sand };
@@ -92,6 +94,8 @@ int main() {
         if (dt > 0.05f) dt = 0.05f;
 
         if (state == GameState::MENU) {
+            bool skip = skipInput;
+            if (skipInput) { skipInput = false; }
             if (!cursorLocked) {
                 EnableCursor();
                 cursorLocked = true;
@@ -105,20 +109,23 @@ int main() {
             bool mouseOverPlay = CheckCollisionPointRec(mousePos, { btnX, playBtnY, btnW, btnH });
             bool mouseOverQuit = CheckCollisionPointRec(mousePos, { btnX, quitBtnY, btnW, btnH });
 
-            bool startGame = (mouseOverPlay && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) || IsKeyPressed(KEY_ENTER);
-            bool quitGame = (mouseOverQuit && IsMouseButtonPressed(MOUSE_BUTTON_LEFT));
+            bool startGame = !skip && ((mouseOverPlay && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) || IsKeyPressed(KEY_ENTER));
+            bool quitGame = !skip && (mouseOverQuit && IsMouseButtonPressed(MOUSE_BUTTON_LEFT));
 
             if (startGame) {
                 world = new World();
-                world->Generate();
-                spawnX = WORLD_SIZE_X / 2;
-                spawnZ = WORLD_SIZE_Z / 2;
+                for (int dx = -2; dx <= 2; dx++)
+                    for (int dz = -2; dz <= 2; dz++)
+                        world->EnsureChunk(dx, dz);
+                spawnX = 0;
+                spawnZ = 0;
                 groundY = world->HeightAt(spawnX, spawnZ);
                 player = {};
                 player.pos = { (float)spawnX + 0.5f, (float)(groundY + 1), (float)spawnZ + 0.5f };
                 selected = 0;
                 DisableCursor();
                 cursorLocked = false;
+                skipInput = true;
                 state = GameState::PLAYING;
             }
             if (quitGame) break;
@@ -151,6 +158,13 @@ int main() {
             DrawFPS(10, 10);
             EndDrawing();
         } else if (state == GameState::PLAYING) {
+            if (IsKeyPressed(KEY_ESCAPE)) {
+                EnableCursor();
+                skipInput = true;
+                state = GameState::PAUSED;
+                continue;
+            }
+
             Vector2 mouseDelta = GetMouseDelta();
             player.yaw -= mouseDelta.x * MOUSE_SENSITIVITY;
             player.pitch -= mouseDelta.y * MOUSE_SENSITIVITY;
@@ -193,6 +207,12 @@ int main() {
 
             Vector3 eye = { player.pos.x, player.pos.y + EYE_HEIGHT, player.pos.z };
 
+            int pcx = (int)floorf(player.pos.x / CHUNK_SIZE);
+            int pcz = (int)floorf(player.pos.z / CHUNK_SIZE);
+            for (int dx = -RENDER_DISTANCE; dx <= RENDER_DISTANCE; dx++)
+                for (int dz = -RENDER_DISTANCE; dz <= RENDER_DISTANCE; dz++)
+                    world->EnsureChunk(pcx + dx, pcz + dz);
+
             Vector3 breakPos{}, placePos{};
             bool hit = world->Raycast(eye, forward, REACH, breakPos, placePos);
 
@@ -209,7 +229,7 @@ int main() {
                 if (IsKeyPressed(KEY_ONE + k)) selected = k;
             }
 
-            world->RebuildDirtyChunks();
+            world->RebuildDirtyChunks(eye, RENDER_DISTANCE * CHUNK_SIZE);
 
             Camera3D camera{};
             camera.position = eye;
@@ -222,7 +242,7 @@ int main() {
             ClearBackground(Color{ 135, 206, 235, 255 });
 
             BeginMode3D(camera);
-            world->Render();
+            world->Render(eye, RENDER_DISTANCE * CHUNK_SIZE);
             if (hit) {
                 Vector3 center = { breakPos.x + 0.5f, breakPos.y + 0.5f, breakPos.z + 0.5f };
                 DrawCubeWires(center, 1.02f, 1.02f, 1.02f, BLACK);
@@ -238,6 +258,72 @@ int main() {
             }
             DrawFPS(10, 10);
 
+            EndDrawing();
+        } else if (state == GameState::PAUSED) {
+            bool skip = skipInput;
+            if (skipInput) { skipInput = false; }
+            Vector2 mousePos = GetMousePosition();
+            float btnW = 240, btnH = 50;
+            float btnX = screenWidth / 2.0f - btnW / 2.0f;
+            float resumeBtnY = screenHeight / 2.0f - 10;
+            float menuBtnY = resumeBtnY + 70;
+            bool mouseOverResume = CheckCollisionPointRec(mousePos, { btnX, resumeBtnY, btnW, btnH });
+            bool mouseOverMenu = CheckCollisionPointRec(mousePos, { btnX, menuBtnY, btnW, btnH });
+
+            if (!skip && mouseOverResume && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+                DisableCursor();
+                skipInput = true;
+                state = GameState::PLAYING;
+            }
+            if (!skip && mouseOverMenu && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+                cursorLocked = true;
+                delete world;
+                world = nullptr;
+                skipInput = true;
+                state = GameState::MENU;
+                continue;
+            }
+
+            Camera3D camera{};
+            Vector3 eye = { player.pos.x, player.pos.y + EYE_HEIGHT, player.pos.z };
+            Vector3 forward = {
+                cosf(player.pitch) * sinf(player.yaw),
+                sinf(player.pitch),
+                cosf(player.pitch) * cosf(player.yaw)
+            };
+            camera.position = eye;
+            camera.target = { eye.x + forward.x, eye.y + forward.y, eye.z + forward.z };
+            camera.up = { 0.0f, 1.0f, 0.0f };
+            camera.fovy = 70.0f;
+            camera.projection = CAMERA_PERSPECTIVE;
+
+            BeginDrawing();
+            ClearBackground(Color{ 135, 206, 235, 255 });
+
+            BeginMode3D(camera);
+            world->Render(eye, RENDER_DISTANCE * CHUNK_SIZE);
+            EndMode3D();
+
+            DrawRectangle(0, 0, screenWidth, screenHeight, Color{ 0, 0, 0, 140 });
+
+            const char* pauseTitle = "PAUSED";
+            int pauseTitleSize = 50;
+            int pauseTitleW = MeasureText(pauseTitle, pauseTitleSize);
+            DrawText(pauseTitle, screenWidth / 2 - pauseTitleW / 2, screenHeight / 2 - 110, pauseTitleSize, WHITE);
+
+            Color resumeBg = mouseOverResume ? Color{ 80, 160, 80, 255 } : Color{ 60, 120, 60, 255 };
+            DrawRectangle((int)btnX, (int)resumeBtnY, (int)btnW, (int)btnH, resumeBg);
+            const char* resumeText = "Resume";
+            int resumeTextW = MeasureText(resumeText, 24);
+            DrawText(resumeText, (int)(btnX + btnW / 2 - resumeTextW / 2), (int)(resumeBtnY + 13), 24, WHITE);
+
+            Color menuBg = mouseOverMenu ? Color{ 160, 60, 60, 255 } : Color{ 120, 50, 50, 255 };
+            DrawRectangle((int)btnX, (int)menuBtnY, (int)btnW, (int)btnH, menuBg);
+            const char* menuText = "Quit to Menu";
+            int menuTextW = MeasureText(menuText, 24);
+            DrawText(menuText, (int)(btnX + btnW / 2 - menuTextW / 2), (int)(menuBtnY + 13), 24, WHITE);
+
+            DrawFPS(10, 10);
             EndDrawing();
         }
     }
