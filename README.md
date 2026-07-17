@@ -17,7 +17,7 @@ A minimal Minecraft-style voxel sandbox built with C++ and [raylib](https://www.
 Clone the repo and pull in the raylib submodule:
 
 ```sh
-git clone <this-repo-url>
+git clone https://github.com/siddharthroy12/minicraft.git
 cd minicraft
 git submodule update --init --recursive
 ```
@@ -44,15 +44,3 @@ The first build also compiles raylib itself from source, so it will take a littl
 On Windows the executable will be at `build\Debug\minicraft.exe` or `build\Release\minicraft.exe` depending on generator/config.
 
 After editing source files, just re-run the build command — you don't need to redo the `cmake -S . -B build` configure step unless `CMakeLists.txt` changes.
-
-## Controls
-
-- **Mouse** — look around (cursor is captured in-game)
-- **W / A / S / D** — move
-- **Space** — jump
-- **Left click** — break the targeted block
-- **Right click** — place the selected block
-- **1–5** — select block type (Dirt, Stone, Wood, Leaves, Sand)
-- **Esc** — quit
-
-From the main menu, click **Play** (or press Enter) to start, or **Quit** to exit.
