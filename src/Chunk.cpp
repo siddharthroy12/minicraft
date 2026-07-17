@@ -123,7 +123,7 @@ static Color ApplyAO(Color base, int ao) {
 static void AddFace(std::vector<float>& verts, std::vector<float>& uvs, std::vector<unsigned char>& cols,
                      World& world, int x, int y, int z, Face face, BlockType type) {
     Color base = GetFaceShade(face);
-    Rectangle uv = GetTileUV(GetTileIndex(type, face));
+    Rectangle uv = GetTileUV(type, face);
     FaceAO ao = ComputeFaceAO(world, x, y, z, face);
     Color colA = ApplyAO(base, ao.a);
     Color colB = ApplyAO(base, ao.b);

@@ -2,6 +2,33 @@
 #include "raymath.h"
 #include <cmath>
 
+// Each block loads a single PNG from assets/textures/<name>.png. The image's
+// width (in TILE_SIZE columns) selects how its faces are laid out:
+//   1 tile  -> same texture on every face
+//   2 tiles -> [top/bottom, side]
+//   3 tiles -> [top, side, bottom]
+// Missing or malformed files fall back to a procedurally generated texture
+// so the game still renders before the user supplies their own art.
+
+struct BlockTiles {
+    int top = 0, side = 0, bottom = 0;
+};
+
+static BlockTiles tilesByBlock[(int)BlockType::Count];
+static int atlasTileCount = 1;
+
+static const char* BlockFileName(BlockType type) {
+    switch (type) {
+        case BlockType::Grass:  return "assets/textures/grass.png";
+        case BlockType::Dirt:   return "assets/textures/dirt.png";
+        case BlockType::Stone:  return "assets/textures/stone.png";
+        case BlockType::Sand:   return "assets/textures/sand.png";
+        case BlockType::Wood:   return "assets/textures/wood.png";
+        case BlockType::Leaves: return "assets/textures/leaves.png";
+        default: return nullptr;
+    }
+}
+
 static Color Noisy(Color base, int variance) {
     int r = base.r + GetRandomValue(-variance, variance);
     int g = base.g + GetRandomValue(-variance, variance);
@@ -82,17 +109,108 @@ static void GenLeaves(Image& img, int t) {
             Put(img, t, x, y, Noisy(Color{63, 122, 47, 255}, 26));
 }
 
-Texture2D LoadBlockAtlas() {
-    Image atlas = GenImageColor(TILE_SIZE * ATLAS_TILE_COUNT, TILE_SIZE, WHITE);
+// Builds a fallback strip using the same tile-count convention as a
+// user-supplied file, so the atlas-packing code below can't tell the
+// difference between the two.
+static Image GenerateFallbackImage(BlockType type, int& outTileCount) {
+    switch (type) {
+        case BlockType::Grass: {
+            Image img = GenImageColor(TILE_SIZE * 3, TILE_SIZE, WHITE);
+            GenGrassTop(img, 0);
+            GenGrassSide(img, 1);
+            GenDirt(img, 2);
+            outTileCount = 3;
+            return img;
+        }
+        case BlockType::Wood: {
+            Image img = GenImageColor(TILE_SIZE * 2, TILE_SIZE, WHITE);
+            GenWoodTop(img, 0);
+            GenWoodSide(img, 1);
+            outTileCount = 2;
+            return img;
+        }
+        case BlockType::Dirt: {
+            Image img = GenImageColor(TILE_SIZE, TILE_SIZE, WHITE);
+            GenDirt(img, 0);
+            outTileCount = 1;
+            return img;
+        }
+        case BlockType::Sand: {
+            Image img = GenImageColor(TILE_SIZE, TILE_SIZE, WHITE);
+            GenSand(img, 0);
+            outTileCount = 1;
+            return img;
+        }
+        case BlockType::Leaves: {
+            Image img = GenImageColor(TILE_SIZE, TILE_SIZE, WHITE);
+            GenLeaves(img, 0);
+            outTileCount = 1;
+            return img;
+        }
+        case BlockType::Stone:
+        default: {
+            Image img = GenImageColor(TILE_SIZE, TILE_SIZE, WHITE);
+            GenStone(img, 0);
+            outTileCount = 1;
+            return img;
+        }
+    }
+}
 
-    GenGrassTop(atlas, TILE_GRASS_TOP);
-    GenGrassSide(atlas, TILE_GRASS_SIDE);
-    GenDirt(atlas, TILE_DIRT);
-    GenStone(atlas, TILE_STONE);
-    GenSand(atlas, TILE_SAND);
-    GenWoodTop(atlas, TILE_WOOD_TOP);
-    GenWoodSide(atlas, TILE_WOOD_SIDE);
-    GenLeaves(atlas, TILE_LEAVES);
+// Loads assets/textures/<name>.png for the block, or generates a fallback
+// strip if the file is missing or its dimensions don't fit the convention.
+static Image LoadBlockImage(BlockType type, int& outTileCount) {
+    const char* path = BlockFileName(type);
+    if (path && FileExists(path)) {
+        Image img = LoadImage(path);
+        if (img.data && img.height == TILE_SIZE && img.width % TILE_SIZE == 0) {
+            int tileCount = img.width / TILE_SIZE;
+            if (tileCount >= 1 && tileCount <= 3) {
+                outTileCount = tileCount;
+                return img;
+            }
+        }
+        TraceLog(LOG_WARNING, "Textures: '%s' is %dx%d, expected height %d and width a multiple of %d (1-3 tiles); using generated texture instead",
+                  path, img.width, img.height, TILE_SIZE, TILE_SIZE);
+        if (img.data) UnloadImage(img);
+    }
+    return GenerateFallbackImage(type, outTileCount);
+}
+
+Texture2D LoadBlockAtlas() {
+    Image images[(int)BlockType::Count]{};
+    int tileCounts[(int)BlockType::Count]{};
+    int totalTiles = 0;
+
+    for (int i = 1; i < (int)BlockType::Count; i++) {
+        images[i] = LoadBlockImage((BlockType)i, tileCounts[i]);
+        totalTiles += tileCounts[i];
+    }
+
+    Image atlas = GenImageColor(TILE_SIZE * totalTiles, TILE_SIZE, WHITE);
+    int cursor = 0;
+    for (int i = 1; i < (int)BlockType::Count; i++) {
+        int tileCount = tileCounts[i];
+        Rectangle srcRec = {0, 0, (float)(TILE_SIZE * tileCount), (float)TILE_SIZE};
+        Vector2 dstPos = {(float)(cursor * TILE_SIZE), 0};
+        ImageDrawImageRec(&atlas, images[i], srcRec, dstPos, WHITE);
+        UnloadImage(images[i]);
+
+        BlockTiles bt{};
+        if (tileCount == 1) {
+            bt.top = bt.side = bt.bottom = cursor;
+        } else if (tileCount == 2) {
+            bt.top = bt.bottom = cursor;
+            bt.side = cursor + 1;
+        } else {
+            bt.top = cursor;
+            bt.side = cursor + 1;
+            bt.bottom = cursor + 2;
+        }
+        tilesByBlock[i] = bt;
+        cursor += tileCount;
+    }
+    atlasTileCount = totalTiles > 0 ? totalTiles : 1;
 
     Texture2D tex = LoadTextureFromImage(atlas);
     UnloadImage(atlas);
@@ -100,30 +218,13 @@ Texture2D LoadBlockAtlas() {
     return tex;
 }
 
-int GetTileIndex(BlockType type, Face face) {
-    switch (type) {
-        case BlockType::Grass:
-            if (face == Face::PosY) return TILE_GRASS_TOP;
-            if (face == Face::NegY) return TILE_DIRT;
-            return TILE_GRASS_SIDE;
-        case BlockType::Dirt:
-            return TILE_DIRT;
-        case BlockType::Stone:
-            return TILE_STONE;
-        case BlockType::Sand:
-            return TILE_SAND;
-        case BlockType::Wood:
-            if (face == Face::PosY || face == Face::NegY) return TILE_WOOD_TOP;
-            return TILE_WOOD_SIDE;
-        case BlockType::Leaves:
-            return TILE_LEAVES;
-        default:
-            return TILE_STONE;
-    }
-}
+Rectangle GetTileUV(BlockType type, Face face) {
+    const BlockTiles& bt = tilesByBlock[(int)type];
+    int tileIndex = bt.side;
+    if (face == Face::PosY) tileIndex = bt.top;
+    else if (face == Face::NegY) tileIndex = bt.bottom;
 
-Rectangle GetTileUV(int tileIndex) {
-    float u0 = (float)tileIndex / ATLAS_TILE_COUNT;
-    float w = 1.0f / ATLAS_TILE_COUNT;
+    float u0 = (float)tileIndex / atlasTileCount;
+    float w = 1.0f / atlasTileCount;
     return Rectangle{u0, 0.0f, w, 1.0f};
 }
