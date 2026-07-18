@@ -1,6 +1,7 @@
 #include "raylib.h"
 #include "rlgl.h"
 #include "World.h"
+#include "Textures.h"
 #include <cmath>
 #include <ctime>
 #include <cstdio>
@@ -585,6 +586,9 @@ int main() {
             for (int k = 0; k < 6; k++) {
                 if (IsKeyPressed(KEY_ONE + k)) selected = k;
             }
+            float wheel = GetMouseWheelMove();
+            if (wheel < 0.0f) selected = (selected + 1) % 6;
+            else if (wheel > 0.0f) selected = (selected + 5) % 6;
 
             world->RebuildDirtyChunks(eye, RENDER_DISTANCE * CHUNK_SIZE);
             world->UpdateWater(dt);
@@ -617,9 +621,29 @@ int main() {
             DrawLine(GetScreenWidth() / 2 - 8, GetScreenHeight() / 2, GetScreenWidth() / 2 + 8, GetScreenHeight() / 2, WHITE);
             DrawLine(GetScreenWidth() / 2, GetScreenHeight() / 2 - 8, GetScreenWidth() / 2, GetScreenHeight() / 2 + 8, WHITE);
 
-            for (int k = 0; k < 6; k++) {
-                Color c = (k == selected) ? YELLOW : WHITE;
-                DrawGUI(TextFormat("%d:%s", k + 1, hotbarNames[k]), 10 + k * 130, GetScreenHeight() - 30, 16, c);
+            {
+                const int slotSize = 48, slotPad = 4;
+                int barW = 6 * slotSize + 5 * slotPad;
+                int barX = GetScreenWidth() / 2 - barW / 2;
+                int barY = GetScreenHeight() - slotSize - 14;
+                Texture2D atlas = world->GetAtlas();
+                for (int k = 0; k < 6; k++) {
+                    int sx = barX + k * (slotSize + slotPad);
+                    DrawRectangle(sx, barY, slotSize, slotSize, Color{ 0, 0, 0, 130 });
+                    Rectangle uv = GetTileUV(hotbar[k], Face::PosZ);
+                    Rectangle src = { uv.x * atlas.width, uv.y * atlas.height, uv.width * atlas.width, uv.height * atlas.height };
+                    Rectangle dst = { (float)(sx + 7), (float)(barY + 7), (float)(slotSize - 14), (float)(slotSize - 14) };
+                    DrawTexturePro(atlas, src, dst, { 0, 0 }, 0.0f, WHITE);
+                    if (k == selected) {
+                        DrawRectangleLinesEx({ (float)(sx - 2), (float)(barY - 2), (float)(slotSize + 4), (float)(slotSize + 4) }, 3, WHITE);
+                    } else {
+                        DrawRectangleLinesEx({ (float)sx, (float)barY, (float)slotSize, (float)slotSize }, 1, Color{ 190, 190, 190, 160 });
+                    }
+                    DrawGUI(TextFormat("%d", k + 1), sx + 3, barY + 1, 12, Color{ 255, 255, 255, 210 });
+                }
+                const char* selName = hotbarNames[selected];
+                int selNameW = MeasureGUI(selName, 16);
+                DrawGUI(selName, GetScreenWidth() / 2 - selNameW / 2, barY - 26, 16, WHITE);
             }
             DrawFPS(10, 10);
 

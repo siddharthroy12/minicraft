@@ -40,6 +40,7 @@ public:
     void EnsureChunk(int cx, int cz);
 
     unsigned int GetSeed() const { return seed; }
+    Texture2D GetAtlas() const { return material.maps[MATERIAL_MAP_DIFFUSE].texture; }
 
     void SetPlayerState(Vector3 pos, float yaw, float pitch);
     Vector3 GetPlayerPos() const { return playerPos; }
