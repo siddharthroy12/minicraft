@@ -160,10 +160,124 @@ static void AddFace(std::vector<float>& verts, std::vector<float>& uvs, std::vec
     }
 }
 
+// Source blocks and falling (waterfall) columns render at full cube height;
+// flowing water gets shorter the farther it is from a source, matching
+// Minecraft's 8-step water levels.
+static float WaterHeight(unsigned char raw) {
+    bool falling = raw & 0x8;
+    int level = raw & 0x7;
+    if (falling || level == 0) return 1.0f;
+    return 1.0f - (level / 8.0f);
+}
+
+struct FaceHeights { float a, b, c, d; }; // matches Face::PosY's a,b,c,d vertex order in AddFace
+
+// Averages this water block's surface height with whichever of its 3
+// touching neighbor columns (edge, edge, diagonal) are also water at the
+// same layer, producing the smoothly-sloped, quilted surface Minecraft's
+// water is known for. Falling columns skip this and stay flat/vertical.
+static FaceHeights ComputeWaterCornerHeights(World& world, int x, int y, int z) {
+    unsigned char rawSelf = world.GetWaterLevelRaw(x, y, z);
+    if (rawSelf & 0x8) return {1.0f, 1.0f, 1.0f, 1.0f};
+
+    float selfHeight = WaterHeight(rawSelf);
+    static const int cu[4] = {0, 0, 1, 1};
+    static const int cv[4] = {0, 1, 1, 0};
+    float heights[4];
+    for (int i = 0; i < 4; i++) {
+        int su = cu[i] ? 1 : -1;
+        int sv = cv[i] ? 1 : -1;
+        float sum = selfHeight;
+        int count = 1;
+        if (world.GetBlock(x + su, y, z) == BlockType::Water) {
+            sum += WaterHeight(world.GetWaterLevelRaw(x + su, y, z));
+            count++;
+        }
+        if (world.GetBlock(x, y, z + sv) == BlockType::Water) {
+            sum += WaterHeight(world.GetWaterLevelRaw(x, y, z + sv));
+            count++;
+        }
+        if (world.GetBlock(x + su, y, z + sv) == BlockType::Water) {
+            sum += WaterHeight(world.GetWaterLevelRaw(x + su, y, z + sv));
+            count++;
+        }
+        heights[i] = sum / count;
+    }
+    return {heights[0], heights[1], heights[2], heights[3]};
+}
+
+static void AddWaterFace(std::vector<float>& verts, std::vector<float>& uvs, std::vector<unsigned char>& cols,
+                          World& world, int x, int y, int z, Face face, const FaceHeights& h) {
+    Color base = GetFaceShade(face);
+    base.a = 210;
+    Rectangle uv = GetTileUV(BlockType::Water, face);
+    FaceAO ao = ComputeFaceAO(world, x, y, z, face);
+    Color colA = ApplyAO(base, ao.a);
+    Color colB = ApplyAO(base, ao.b);
+    Color colC = ApplyAO(base, ao.c);
+    Color colD = ApplyAO(base, ao.d);
+    bool flip = (ao.a + ao.c) < (ao.b + ao.d);
+
+    // Side faces slope their top edge to match the top face's corner
+    // heights on that edge (a waterfall "lip"); bottom edge stays flat.
+    float fx = (float)x, fy = (float)y, fz = (float)z;
+    switch (face) {
+        case Face::PosX:
+            PushQuad(verts, uvs, cols, {fx+1,fy,fz}, {fx+1,fy+h.d,fz}, {fx+1,fy+h.c,fz+1}, {fx+1,fy,fz+1}, uv,
+                      colA, colB, colC, colD, flip);
+            break;
+        case Face::NegX:
+            PushQuad(verts, uvs, cols, {fx,fy,fz+1}, {fx,fy+h.b,fz+1}, {fx,fy+h.a,fz}, {fx,fy,fz}, uv,
+                      colA, colB, colC, colD, flip);
+            break;
+        case Face::PosY:
+            PushQuad(verts, uvs, cols, {fx,fy+h.a,fz}, {fx,fy+h.b,fz+1}, {fx+1,fy+h.c,fz+1}, {fx+1,fy+h.d,fz}, uv,
+                      colA, colB, colC, colD, flip);
+            break;
+        case Face::NegY:
+            PushQuad(verts, uvs, cols, {fx,fy,fz+1}, {fx,fy,fz}, {fx+1,fy,fz}, {fx+1,fy,fz+1}, uv,
+                      colA, colB, colC, colD, flip);
+            break;
+        case Face::PosZ:
+            PushQuad(verts, uvs, cols, {fx+1,fy,fz+1}, {fx+1,fy+h.c,fz+1}, {fx,fy+h.b,fz+1}, {fx,fy,fz+1}, uv,
+                      colA, colB, colC, colD, flip);
+            break;
+        case Face::NegZ:
+            PushQuad(verts, uvs, cols, {fx,fy,fz}, {fx,fy+h.a,fz}, {fx+1,fy+h.d,fz}, {fx+1,fy,fz}, uv,
+                      colA, colB, colC, colD, flip);
+            break;
+    }
+}
+
+static void UploadChunkMesh(Mesh& mesh, bool& hasMesh, std::vector<float>& verts, std::vector<float>& uvs, std::vector<unsigned char>& cols) {
+    if (hasMesh) {
+        UnloadMesh(mesh);
+        hasMesh = false;
+        mesh = Mesh{};
+    }
+
+    if (verts.empty()) return;
+
+    Mesh m{};
+    int vertexCount = (int)(verts.size() / 3);
+    m.vertexCount = vertexCount;
+    m.triangleCount = vertexCount / 3;
+    m.vertices = (float*)malloc(verts.size() * sizeof(float));
+    memcpy(m.vertices, verts.data(), verts.size() * sizeof(float));
+    m.texcoords = (float*)malloc(uvs.size() * sizeof(float));
+    memcpy(m.texcoords, uvs.data(), uvs.size() * sizeof(float));
+    m.colors = (unsigned char*)malloc(cols.size() * sizeof(unsigned char));
+    memcpy(m.colors, cols.data(), cols.size() * sizeof(unsigned char));
+
+    UploadMesh(&m, false);
+    mesh = m;
+    hasMesh = true;
+}
+
 void BuildChunkMesh(World& world, int cx, int cz, Chunk& chunk) {
-    std::vector<float> verts;
-    std::vector<float> uvs;
-    std::vector<unsigned char> cols;
+    std::vector<float> verts, waterVerts;
+    std::vector<float> uvs, waterUvs;
+    std::vector<unsigned char> cols, waterCols;
 
     int startX = cx * CHUNK_SIZE;
     int startZ = cz * CHUNK_SIZE;
@@ -176,36 +290,30 @@ void BuildChunkMesh(World& world, int cx, int cz, Chunk& chunk) {
                 BlockType t = world.GetBlock(x, y, z);
                 if (t == BlockType::Air) continue;
 
-                if (!world.IsSolid(x + 1, y, z)) AddFace(verts, uvs, cols, world, x, y, z, Face::PosX, t);
-                if (!world.IsSolid(x - 1, y, z)) AddFace(verts, uvs, cols, world, x, y, z, Face::NegX, t);
-                if (!world.IsSolid(x, y + 1, z)) AddFace(verts, uvs, cols, world, x, y, z, Face::PosY, t);
-                if (!world.IsSolid(x, y - 1, z)) AddFace(verts, uvs, cols, world, x, y, z, Face::NegY, t);
-                if (!world.IsSolid(x, y, z + 1)) AddFace(verts, uvs, cols, world, x, y, z, Face::PosZ, t);
-                if (!world.IsSolid(x, y, z - 1)) AddFace(verts, uvs, cols, world, x, y, z, Face::NegZ, t);
+                if (t == BlockType::Water) {
+                    // Water only shows a face against open air: culling it
+                    // against solid blocks would hide the ground/walls seen
+                    // through it, and culling it against other water avoids
+                    // rendering invisible internal surfaces.
+                    FaceHeights h = ComputeWaterCornerHeights(world, x, y, z);
+                    if (world.GetBlock(x + 1, y, z) == BlockType::Air) AddWaterFace(waterVerts, waterUvs, waterCols, world, x, y, z, Face::PosX, h);
+                    if (world.GetBlock(x - 1, y, z) == BlockType::Air) AddWaterFace(waterVerts, waterUvs, waterCols, world, x, y, z, Face::NegX, h);
+                    if (world.GetBlock(x, y + 1, z) == BlockType::Air) AddWaterFace(waterVerts, waterUvs, waterCols, world, x, y, z, Face::PosY, h);
+                    if (world.GetBlock(x, y - 1, z) == BlockType::Air) AddWaterFace(waterVerts, waterUvs, waterCols, world, x, y, z, Face::NegY, h);
+                    if (world.GetBlock(x, y, z + 1) == BlockType::Air) AddWaterFace(waterVerts, waterUvs, waterCols, world, x, y, z, Face::PosZ, h);
+                    if (world.GetBlock(x, y, z - 1) == BlockType::Air) AddWaterFace(waterVerts, waterUvs, waterCols, world, x, y, z, Face::NegZ, h);
+                } else {
+                    if (!world.IsSolid(x + 1, y, z)) AddFace(verts, uvs, cols, world, x, y, z, Face::PosX, t);
+                    if (!world.IsSolid(x - 1, y, z)) AddFace(verts, uvs, cols, world, x, y, z, Face::NegX, t);
+                    if (!world.IsSolid(x, y + 1, z)) AddFace(verts, uvs, cols, world, x, y, z, Face::PosY, t);
+                    if (!world.IsSolid(x, y - 1, z)) AddFace(verts, uvs, cols, world, x, y, z, Face::NegY, t);
+                    if (!world.IsSolid(x, y, z + 1)) AddFace(verts, uvs, cols, world, x, y, z, Face::PosZ, t);
+                    if (!world.IsSolid(x, y, z - 1)) AddFace(verts, uvs, cols, world, x, y, z, Face::NegZ, t);
+                }
             }
         }
     }
 
-    if (chunk.hasMesh) {
-        UnloadMesh(chunk.mesh);
-        chunk.hasMesh = false;
-        chunk.mesh = Mesh{};
-    }
-
-    if (verts.empty()) return;
-
-    Mesh mesh{};
-    int vertexCount = (int)(verts.size() / 3);
-    mesh.vertexCount = vertexCount;
-    mesh.triangleCount = vertexCount / 3;
-    mesh.vertices = (float*)malloc(verts.size() * sizeof(float));
-    memcpy(mesh.vertices, verts.data(), verts.size() * sizeof(float));
-    mesh.texcoords = (float*)malloc(uvs.size() * sizeof(float));
-    memcpy(mesh.texcoords, uvs.data(), uvs.size() * sizeof(float));
-    mesh.colors = (unsigned char*)malloc(cols.size() * sizeof(unsigned char));
-    memcpy(mesh.colors, cols.data(), cols.size() * sizeof(unsigned char));
-
-    UploadMesh(&mesh, false);
-    chunk.mesh = mesh;
-    chunk.hasMesh = true;
+    UploadChunkMesh(chunk.mesh, chunk.hasMesh, verts, uvs, cols);
+    UploadChunkMesh(chunk.waterMesh, chunk.hasWaterMesh, waterVerts, waterUvs, waterCols);
 }

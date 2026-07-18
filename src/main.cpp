@@ -17,6 +17,7 @@ constexpr float JUMP_VELOCITY = 8.0f;
 constexpr float MOVE_SPEED = 5.0f;
 constexpr float MOUSE_SENSITIVITY = 0.003f;
 constexpr float REACH = 6.0f;
+constexpr float THIRD_PERSON_DISTANCE = 5.0f;
 
 enum class GameState { MENU, CREATE_WORLD, LOAD_WORLD, PLAYING, PAUSED };
 
@@ -59,6 +60,43 @@ static void MoveAndCollide(World& world, Player& p, Vector3 delta) {
     } else {
         p.grounded = false;
     }
+}
+
+// Steps a camera back along `back` from `eye`, stopping just before it would
+// enter a solid block so the third-person view doesn't clip through walls.
+static Vector3 ThirdPersonCameraPos(World& world, Vector3 eye, Vector3 back, float maxDist) {
+    const float step = 0.1f;
+    float dist = 0.0f;
+    while (dist < maxDist) {
+        float next = dist + step;
+        Vector3 p = { eye.x + back.x * next, eye.y + back.y * next, eye.z + back.z * next };
+        if (world.IsSolid((int)floorf(p.x), (int)floorf(p.y), (int)floorf(p.z))) break;
+        dist = next;
+    }
+    return { eye.x + back.x * dist, eye.y + back.y * dist, eye.z + back.z * dist };
+}
+
+static void DrawPlayerModel(const Player& p) {
+    constexpr float legHeight = 0.8f, torsoHeight = 0.6f, headSize = 0.4f;
+    constexpr Color pants = { 60, 60, 140, 255 };
+    constexpr Color shirt = { 40, 130, 180, 255 };
+    constexpr Color skin = { 235, 190, 150, 255 };
+
+    rlPushMatrix();
+    rlTranslatef(p.pos.x, p.pos.y, p.pos.z);
+    rlRotatef(-p.yaw * RAD2DEG, 0, 1, 0);
+
+    Vector3 legsCenter = { 0, legHeight / 2, 0 };
+    DrawCube(legsCenter, PLAYER_HALF_WIDTH * 1.8f, legHeight, PLAYER_HALF_WIDTH * 1.8f, pants);
+
+    Vector3 torsoCenter = { 0, legHeight + torsoHeight / 2, 0 };
+    DrawCube(torsoCenter, PLAYER_HALF_WIDTH * 2.0f, torsoHeight, PLAYER_HALF_WIDTH * 2.0f, shirt);
+
+    Vector3 headCenter = { 0, legHeight + torsoHeight + headSize / 2, 0 };
+    DrawCube(headCenter, headSize, headSize, headSize, skin);
+    DrawCubeWires(headCenter, headSize, headSize, headSize, BLACK);
+
+    rlPopMatrix();
 }
 
 static bool BoxOverlapsPlayer(Player& p, Vector3 blockPos) {
@@ -216,6 +254,7 @@ int main() {
     GameState state = GameState::MENU;
     bool cursorLocked = false;
     bool skipInput = false;
+    bool thirdPerson = false;
 
     World* world = nullptr;
     Player player{};
@@ -223,8 +262,8 @@ int main() {
     int spawnZ = 0;
     int groundY = 0;
 
-    BlockType hotbar[5] = { BlockType::Dirt, BlockType::Stone, BlockType::Wood, BlockType::Leaves, BlockType::Sand };
-    const char* hotbarNames[5] = { "Dirt", "Stone", "Wood", "Leaves", "Sand" };
+    BlockType hotbar[6] = { BlockType::Dirt, BlockType::Stone, BlockType::Wood, BlockType::Leaves, BlockType::Sand, BlockType::Water };
+    const char* hotbarNames[6] = { "Dirt", "Stone", "Wood", "Leaves", "Sand", "Water" };
     int selected = 0;
 
     char worldNameInput[64] = "";
@@ -472,6 +511,8 @@ int main() {
                 continue;
             }
 
+            if (IsKeyPressed(KEY_F5)) thirdPerson = !thirdPerson;
+
             Vector2 mouseDelta = GetMouseDelta();
             player.yaw -= mouseDelta.x * MOUSE_SENSITIVITY;
             player.pitch -= mouseDelta.y * MOUSE_SENSITIVITY;
@@ -532,24 +573,32 @@ int main() {
                 }
             }
 
-            for (int k = 0; k < 5; k++) {
+            for (int k = 0; k < 6; k++) {
                 if (IsKeyPressed(KEY_ONE + k)) selected = k;
             }
 
             world->RebuildDirtyChunks(eye, RENDER_DISTANCE * CHUNK_SIZE);
+            world->UpdateWater(dt);
+            world->SimulateWater(dt);
 
             Camera3D camera{};
-            camera.position = eye;
+            if (thirdPerson) {
+                Vector3 back = { -forward.x, -forward.y, -forward.z };
+                camera.position = ThirdPersonCameraPos(*world, eye, back, THIRD_PERSON_DISTANCE);
+            } else {
+                camera.position = eye;
+            }
             camera.target = { eye.x + forward.x, eye.y + forward.y, eye.z + forward.z };
             camera.up = { 0.0f, 1.0f, 0.0f };
             camera.fovy = 70.0f;
             camera.projection = CAMERA_PERSPECTIVE;
 
             BeginDrawing();
-            ClearBackground(Color{ 135, 206, 235, 255 });
+            ClearBackground(world->GetFogColor(eye));
 
             BeginMode3D(camera);
             world->Render(eye, RENDER_DISTANCE * CHUNK_SIZE);
+            if (thirdPerson) DrawPlayerModel(player);
             if (hit) {
                 Vector3 center = { breakPos.x + 0.5f, breakPos.y + 0.5f, breakPos.z + 0.5f };
                 DrawCubeWires(center, 1.02f, 1.02f, 1.02f, BLACK);
@@ -559,7 +608,7 @@ int main() {
             DrawLine(GetScreenWidth() / 2 - 8, GetScreenHeight() / 2, GetScreenWidth() / 2 + 8, GetScreenHeight() / 2, WHITE);
             DrawLine(GetScreenWidth() / 2, GetScreenHeight() / 2 - 8, GetScreenWidth() / 2, GetScreenHeight() / 2 + 8, WHITE);
 
-            for (int k = 0; k < 5; k++) {
+            for (int k = 0; k < 6; k++) {
                 Color c = (k == selected) ? YELLOW : WHITE;
                 DrawGUI(TextFormat("%d:%s", k + 1, hotbarNames[k]), 10 + k * 130, GetScreenHeight() - 30, 16, c);
             }
@@ -613,17 +662,23 @@ int main() {
                 sinf(player.pitch),
                 cosf(player.pitch) * cosf(player.yaw)
             };
-            camera.position = eye;
+            if (thirdPerson) {
+                Vector3 back = { -forward.x, -forward.y, -forward.z };
+                camera.position = ThirdPersonCameraPos(*world, eye, back, THIRD_PERSON_DISTANCE);
+            } else {
+                camera.position = eye;
+            }
             camera.target = { eye.x + forward.x, eye.y + forward.y, eye.z + forward.z };
             camera.up = { 0.0f, 1.0f, 0.0f };
             camera.fovy = 70.0f;
             camera.projection = CAMERA_PERSPECTIVE;
 
             BeginDrawing();
-            ClearBackground(Color{ 135, 206, 235, 255 });
+            ClearBackground(world->GetFogColor(eye));
 
             BeginMode3D(camera);
             world->Render(eye, RENDER_DISTANCE * CHUNK_SIZE);
+            if (thirdPerson) DrawPlayerModel(player);
             EndMode3D();
 
             DrawRectangle(0, 0, GetScreenWidth(), GetScreenHeight(), Color{ 0, 0, 0, 140 });

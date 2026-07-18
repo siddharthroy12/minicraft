@@ -10,6 +10,7 @@ enum class BlockType : unsigned char {
     Sand,
     Wood,
     Leaves,
+    Water,
     Count
 };
 

@@ -12,8 +12,14 @@ struct Chunk {
     static constexpr int HEIGHT = CHUNK_HEIGHT;
 
     BlockType blocks[SIZE * HEIGHT * SIZE]{};
+    // Valid only where blocks[i] == Water: bit 0x8 = falling (full-height
+    // waterfall column), bits 0x7 = flow level (0 = source, 7 = weakest).
+    // Zero-initialized, which correctly reads as "source" for generated water.
+    unsigned char waterLevel[SIZE * HEIGHT * SIZE]{};
     Mesh mesh{};
     bool hasMesh = false;
+    Mesh waterMesh{};
+    bool hasWaterMesh = false;
     bool dirty = true;
     bool generated = false;
 

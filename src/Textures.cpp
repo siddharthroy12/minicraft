@@ -17,6 +17,14 @@ struct BlockTiles {
 static BlockTiles tilesByBlock[(int)BlockType::Count];
 static int atlasTileCount = 1;
 
+// Water is animated in place (see UpdateWaterAnimation) rather than loaded
+// from a file, so it's kept out of the BlockFileName/LoadBlockImage path
+// that the other, static block textures go through.
+constexpr int WATER_FRAME_COUNT = 8;
+constexpr float WATER_FRAME_DURATION = 0.15f;
+static Image waterFrames[WATER_FRAME_COUNT];
+static Rectangle waterAtlasPixelRect{};
+
 static const char* BlockFileName(BlockType type) {
     switch (type) {
         case BlockType::Grass:  return "assets/textures/grass.png";
@@ -109,6 +117,26 @@ static void GenLeaves(Image& img, int t) {
             Put(img, t, x, y, Noisy(Color{63, 122, 47, 255}, 26));
 }
 
+// Two overlapping sine ripples whose phases drift with `frame`, giving a
+// scrolling-water look when the frames are played back in sequence.
+static void GenWaterFrame(Image& img, int frame) {
+    float phase = (float)frame / WATER_FRAME_COUNT * 2.0f * PI;
+    for (int y = 0; y < TILE_SIZE; y++) {
+        for (int x = 0; x < TILE_SIZE; x++) {
+            float wave1 = sinf(x * 0.6f + y * 0.4f + phase * 2.0f) * 0.5f + 0.5f;
+            float wave2 = sinf(x * 0.35f - y * 0.5f - phase * 3.0f) * 0.5f + 0.5f;
+            float brightness = 0.8f + 0.2f * (0.5f * wave1 + 0.5f * wave2);
+            Color base = Color{
+                (unsigned char)Clamp(45.0f * brightness, 0, 255),
+                (unsigned char)Clamp(110.0f * brightness, 0, 255),
+                (unsigned char)Clamp(200.0f * brightness, 0, 255),
+                255
+            };
+            ImageDrawPixel(&img, x, y, base);
+        }
+    }
+}
+
 // Builds a fallback strip using the same tile-count convention as a
 // user-supplied file, so the atlas-packing code below can't tell the
 // difference between the two.
@@ -183,7 +211,19 @@ Texture2D LoadBlockAtlas() {
     int totalTiles = 0;
 
     for (int i = 1; i < (int)BlockType::Count; i++) {
-        images[i] = LoadBlockImage((BlockType)i, tileCounts[i]);
+        BlockType type = (BlockType)i;
+        if (type == BlockType::Water) {
+            // Animated in place afterwards; keep the frames resident so
+            // UpdateWaterAnimation can patch the atlas with them later.
+            for (int f = 0; f < WATER_FRAME_COUNT; f++) {
+                waterFrames[f] = GenImageColor(TILE_SIZE, TILE_SIZE, WHITE);
+                GenWaterFrame(waterFrames[f], f);
+            }
+            images[i] = ImageCopy(waterFrames[0]);
+            tileCounts[i] = 1;
+        } else {
+            images[i] = LoadBlockImage(type, tileCounts[i]);
+        }
         totalTiles += tileCounts[i];
     }
 
@@ -208,6 +248,11 @@ Texture2D LoadBlockAtlas() {
             bt.bottom = cursor + 2;
         }
         tilesByBlock[i] = bt;
+
+        if ((BlockType)i == BlockType::Water) {
+            waterAtlasPixelRect = { (float)(cursor * TILE_SIZE), 0.0f, (float)TILE_SIZE, (float)TILE_SIZE };
+        }
+
         cursor += tileCount;
     }
     atlasTileCount = totalTiles > 0 ? totalTiles : 1;
@@ -227,4 +272,19 @@ Rectangle GetTileUV(BlockType type, Face face) {
     float u0 = (float)tileIndex / atlasTileCount;
     float w = 1.0f / atlasTileCount;
     return Rectangle{u0, 0.0f, w, 1.0f};
+}
+
+void UpdateWaterAnimation(Texture2D atlas, float dt) {
+    static float accum = 0.0f;
+    static int frame = 0;
+    accum += dt;
+    bool changed = false;
+    while (accum >= WATER_FRAME_DURATION) {
+        accum -= WATER_FRAME_DURATION;
+        frame = (frame + 1) % WATER_FRAME_COUNT;
+        changed = true;
+    }
+    if (changed) {
+        UpdateTextureRec(atlas, waterAtlasPixelRect, waterFrames[frame].data);
+    }
 }
