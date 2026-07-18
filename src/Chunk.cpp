@@ -206,8 +206,14 @@ static FaceHeights ComputeWaterCornerHeights(World& world, int x, int y, int z) 
     return {heights[0], heights[1], heights[2], heights[3]};
 }
 
+// Side faces span from `bot` to `h` along their shared edge corners: against
+// air, bot is 0 (the full face, with the sloped "lip" top edge); against a
+// shorter water neighbor, bot is the neighbor's surface so only the exposed
+// strip between the two surfaces is drawn. Corner heights of adjacent water
+// blocks agree at shared corners, so strips meet both surfaces seamlessly.
 static void AddWaterFace(std::vector<float>& verts, std::vector<float>& uvs, std::vector<unsigned char>& cols,
-                          World& world, int x, int y, int z, Face face, const FaceHeights& h) {
+                          World& world, int x, int y, int z, Face face, const FaceHeights& h,
+                          const FaceHeights& bot = {0, 0, 0, 0}) {
     Color base = GetFaceShade(face);
     base.a = 210;
     Rectangle uv = GetTileUV(BlockType::Water, face);
@@ -218,16 +224,14 @@ static void AddWaterFace(std::vector<float>& verts, std::vector<float>& uvs, std
     Color colD = ApplyAO(base, ao.d);
     bool flip = (ao.a + ao.c) < (ao.b + ao.d);
 
-    // Side faces slope their top edge to match the top face's corner
-    // heights on that edge (a waterfall "lip"); bottom edge stays flat.
     float fx = (float)x, fy = (float)y, fz = (float)z;
     switch (face) {
         case Face::PosX:
-            PushQuad(verts, uvs, cols, {fx+1,fy,fz}, {fx+1,fy+h.d,fz}, {fx+1,fy+h.c,fz+1}, {fx+1,fy,fz+1}, uv,
+            PushQuad(verts, uvs, cols, {fx+1,fy+bot.d,fz}, {fx+1,fy+h.d,fz}, {fx+1,fy+h.c,fz+1}, {fx+1,fy+bot.c,fz+1}, uv,
                       colA, colB, colC, colD, flip);
             break;
         case Face::NegX:
-            PushQuad(verts, uvs, cols, {fx,fy,fz+1}, {fx,fy+h.b,fz+1}, {fx,fy+h.a,fz}, {fx,fy,fz}, uv,
+            PushQuad(verts, uvs, cols, {fx,fy+bot.b,fz+1}, {fx,fy+h.b,fz+1}, {fx,fy+h.a,fz}, {fx,fy+bot.a,fz}, uv,
                       colA, colB, colC, colD, flip);
             break;
         case Face::PosY:
@@ -239,11 +243,11 @@ static void AddWaterFace(std::vector<float>& verts, std::vector<float>& uvs, std
                       colA, colB, colC, colD, flip);
             break;
         case Face::PosZ:
-            PushQuad(verts, uvs, cols, {fx+1,fy,fz+1}, {fx+1,fy+h.c,fz+1}, {fx,fy+h.b,fz+1}, {fx,fy,fz+1}, uv,
+            PushQuad(verts, uvs, cols, {fx+1,fy+bot.c,fz+1}, {fx+1,fy+h.c,fz+1}, {fx,fy+h.b,fz+1}, {fx,fy+bot.b,fz+1}, uv,
                       colA, colB, colC, colD, flip);
             break;
         case Face::NegZ:
-            PushQuad(verts, uvs, cols, {fx,fy,fz}, {fx,fy+h.a,fz}, {fx+1,fy+h.d,fz}, {fx+1,fy,fz}, uv,
+            PushQuad(verts, uvs, cols, {fx,fy+bot.a,fz}, {fx,fy+h.a,fz}, {fx+1,fy+h.d,fz}, {fx+1,fy+bot.d,fz}, uv,
                       colA, colB, colC, colD, flip);
             break;
     }
@@ -291,17 +295,48 @@ void BuildChunkMesh(World& world, int cx, int cz, Chunk& chunk) {
                 if (t == BlockType::Air) continue;
 
                 if (t == BlockType::Water) {
-                    // Water only shows a face against open air: culling it
-                    // against solid blocks would hide the ground/walls seen
-                    // through it, and culling it against other water avoids
-                    // rendering invisible internal surfaces.
+                    // Water shows a face against open air, and against
+                    // neighboring water that sits *lower* — there, only the
+                    // exposed strip between the two surfaces is drawn (a
+                    // full-height falling column beside partial flowing
+                    // water would otherwise leave a see-through slit).
+                    // Faces against solid blocks stay culled: the solid
+                    // block's own face covers that boundary.
                     FaceHeights h = ComputeWaterCornerHeights(world, x, y, z);
-                    if (world.GetBlock(x + 1, y, z) == BlockType::Air) AddWaterFace(waterVerts, waterUvs, waterCols, world, x, y, z, Face::PosX, h);
-                    if (world.GetBlock(x - 1, y, z) == BlockType::Air) AddWaterFace(waterVerts, waterUvs, waterCols, world, x, y, z, Face::NegX, h);
+                    constexpr float kEps = 0.001f;
+                    auto sideFace = [&](Face face, int nx, int nz) {
+                        BlockType n = world.GetBlock(nx, y, nz);
+                        if (n == BlockType::Air) {
+                            AddWaterFace(waterVerts, waterUvs, waterCols, world, x, y, z, face, h);
+                        } else if (n == BlockType::Water) {
+                            FaceHeights nb = ComputeWaterCornerHeights(world, nx, y, nz);
+                            FaceHeights bot{0, 0, 0, 0};
+                            // Map the neighbor's corners on the shared face
+                            // onto this block's corner slots for that face.
+                            switch (face) {
+                                case Face::PosX: bot.d = nb.a; bot.c = nb.b; break;
+                                case Face::NegX: bot.a = nb.d; bot.b = nb.c; break;
+                                case Face::PosZ: bot.b = nb.a; bot.c = nb.d; break;
+                                case Face::NegZ: bot.a = nb.b; bot.d = nb.c; break;
+                                default: return;
+                            }
+                            bool exposed = false;
+                            switch (face) {
+                                case Face::PosX: exposed = h.d > bot.d + kEps || h.c > bot.c + kEps; break;
+                                case Face::NegX: exposed = h.a > bot.a + kEps || h.b > bot.b + kEps; break;
+                                case Face::PosZ: exposed = h.b > bot.b + kEps || h.c > bot.c + kEps; break;
+                                case Face::NegZ: exposed = h.a > bot.a + kEps || h.d > bot.d + kEps; break;
+                                default: break;
+                            }
+                            if (exposed) AddWaterFace(waterVerts, waterUvs, waterCols, world, x, y, z, face, h, bot);
+                        }
+                    };
+                    sideFace(Face::PosX, x + 1, z);
+                    sideFace(Face::NegX, x - 1, z);
+                    sideFace(Face::PosZ, x, z + 1);
+                    sideFace(Face::NegZ, x, z - 1);
                     if (world.GetBlock(x, y + 1, z) == BlockType::Air) AddWaterFace(waterVerts, waterUvs, waterCols, world, x, y, z, Face::PosY, h);
                     if (world.GetBlock(x, y - 1, z) == BlockType::Air) AddWaterFace(waterVerts, waterUvs, waterCols, world, x, y, z, Face::NegY, h);
-                    if (world.GetBlock(x, y, z + 1) == BlockType::Air) AddWaterFace(waterVerts, waterUvs, waterCols, world, x, y, z, Face::PosZ, h);
-                    if (world.GetBlock(x, y, z - 1) == BlockType::Air) AddWaterFace(waterVerts, waterUvs, waterCols, world, x, y, z, Face::NegZ, h);
                 } else {
                     if (!world.IsSolid(x + 1, y, z)) AddFace(verts, uvs, cols, world, x, y, z, Face::PosX, t);
                     if (!world.IsSolid(x - 1, y, z)) AddFace(verts, uvs, cols, world, x, y, z, Face::NegX, t);
