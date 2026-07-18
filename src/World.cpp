@@ -376,44 +376,117 @@ void World::ScheduleWaterUpdate(int x, int y, int z) {
 }
 
 constexpr int kMaxWaterLevel = 7;
-constexpr float kWaterTickInterval = 0.2f;
+constexpr float kWaterTickInterval = 0.25f; // 5 game ticks at Minecraft's 20 TPS
+constexpr int kSlopeFindDistance = 4;       // wiki: water looks for holes within 4 blocks
+constexpr int kNoHole = 1000;               // wiki: initial weight when no hole is found
+
+static const int kDirX[4] = {1, -1, 0, 0};
+static const int kDirZ[4] = {0, 0, 1, -1};
 
 static unsigned char EncodeWaterRaw(int level, bool falling) {
     return (unsigned char)((falling ? 0x8 : 0) | (level & 0x7));
 }
 
-// Recomputes whether (x,y,z) should be water and at what flow level, the
-// same way each fluid tick works in Minecraft: water directly below other
-// water becomes a full-height falling column; otherwise it takes the
-// strongest (lowest-level) support from its 4 horizontal neighbors, capped
-// at kMaxWaterLevel; with no support at all, existing flowing water dries
-// up. Source blocks (level 0, non-falling) are permanent and skip all this.
+// A "hole" is a position water wants to reach: its below-neighbor is air,
+// or an existing waterfall shaft it can join.
+static bool IsHoleBelow(const World& world, int x, int y, int z) {
+    BlockType below = world.GetBlock(x, y - 1, z);
+    if (below == BlockType::Air) return true;
+    return below == BlockType::Water && (world.GetWaterLevelRaw(x, y - 1, z) & 0x8);
+}
+
+// Distance from (startX,y,startZ) through air cells to the nearest hole.
+// The start cell is already one step from the spreading water block, so the
+// search goes at most kSlopeFindDistance-1 further steps; kNoHole if none.
+static int SlopeDistance(const World& world, int startX, int y, int startZ) {
+    if (IsHoleBelow(world, startX, y, startZ)) return 0;
+    std::vector<std::array<int, 2>> frontier{{startX, startZ}};
+    std::vector<std::array<int, 2>> visited{{startX, startZ}};
+    for (int depth = 1; depth < kSlopeFindDistance; depth++) {
+        std::vector<std::array<int, 2>> next;
+        for (auto& cell : frontier) {
+            for (int i = 0; i < 4; i++) {
+                std::array<int, 2> n{cell[0] + kDirX[i], cell[1] + kDirZ[i]};
+                if (std::find(visited.begin(), visited.end(), n) != visited.end()) continue;
+                visited.push_back(n);
+                if (world.GetBlock(n[0], y, n[1]) != BlockType::Air) continue;
+                if (IsHoleBelow(world, n[0], y, n[1])) return depth;
+                next.push_back(n);
+            }
+        }
+        frontier = std::move(next);
+        if (frontier.empty()) break;
+    }
+    return kNoHole;
+}
+
+// Water pours straight down when nothing is beneath it; it only spreads
+// sideways when resting on solid ground or settled (non-falling) water.
+static bool CanSpreadSideways(const World& world, int x, int y, int z) {
+    BlockType below = world.GetBlock(x, y - 1, z);
+    if (below == BlockType::Air) return false;
+    if (below == BlockType::Water && (world.GetWaterLevelRaw(x, y - 1, z) & 0x8)) return false;
+    return true;
+}
+
+// Bitmask over kDirX/kDirZ of the directions the water block at (x,y,z)
+// actively flows into, per the wiki's flow-weight rule: every enterable
+// (air) direction gets the distance to its nearest reachable hole, and only
+// the minimal-weight directions flow. With no hole in range all enterable
+// directions tie at kNoHole and water spreads out evenly.
+static int PreferredFlowDirs(const World& world, int x, int y, int z) {
+    int weights[4];
+    int minWeight = kNoHole;
+    for (int i = 0; i < 4; i++) {
+        int nx = x + kDirX[i], nz = z + kDirZ[i];
+        if (world.GetBlock(nx, y, nz) != BlockType::Air) { weights[i] = -1; continue; }
+        weights[i] = SlopeDistance(world, nx, y, nz);
+        if (weights[i] < minWeight) minWeight = weights[i];
+    }
+    int mask = 0;
+    for (int i = 0; i < 4; i++) {
+        if (weights[i] >= 0 && weights[i] == minWeight) mask |= 1 << i;
+    }
+    return mask;
+}
+
+// Recomputes whether (x,y,z) should be water and at what flow level,
+// following the wiki's per-tick rules: water directly below other water
+// becomes a full-height falling column; air only receives sideways flow
+// from a neighbor that both rests on something and prefers this direction
+// (nearest-hole weighting); existing flowing water keeps the strongest
+// adjacent support or dries up; and flowing water beside two or more
+// sources, resting on a solid block or another source, becomes a new
+// source (infinite water). Sources themselves are permanent.
 void World::ProcessWaterCell(int x, int y, int z) {
     if (y < 0 || y >= CHUNK_HEIGHT) return;
 
     BlockType t = GetBlock(x, y, z);
     if (t != BlockType::Air && t != BlockType::Water) return;
-
-    if (t == BlockType::Water) {
-        unsigned char raw = GetWaterLevelRaw(x, y, z);
-        if (!(raw & 0x8) && (raw & 0x7) == 0) return; // stable source
-    }
+    if (t == BlockType::Water && GetWaterLevelRaw(x, y, z) == 0) return; // stable source
 
     bool aboveIsWater = GetBlock(x, y + 1, z) == BlockType::Water;
-    int bestLevel = -1;
-    if (!aboveIsWater) {
-        static const int dxs[4] = {1, -1, 0, 0};
-        static const int dzs[4] = {0, 0, 1, -1};
-        for (int i = 0; i < 4; i++) {
-            int nx = x + dxs[i], nz = z + dzs[i];
-            if (GetBlock(nx, y, nz) != BlockType::Water) continue;
-            int nLevel = GetWaterLevelRaw(nx, y, nz) & 0x7;
-            int candidate = nLevel + 1;
-            if (bestLevel == -1 || candidate < bestLevel) bestLevel = candidate;
+
+    int sourceNeighbors = 0;
+    int bestLevel = -1;   // support for existing flowing water (direction-free, like vanilla decay)
+    int acceptLevel = -1; // for air: only neighbors that actively flow this way count
+    for (int i = 0; i < 4; i++) {
+        int nx = x + kDirX[i], nz = z + kDirZ[i];
+        if (GetBlock(nx, y, nz) != BlockType::Water) continue;
+        unsigned char nRaw = GetWaterLevelRaw(nx, y, nz);
+        if (nRaw == 0) sourceNeighbors++;
+        int candidate = (nRaw & 0x7) + 1; // falling columns spread at full strength, like sources
+        if (candidate > kMaxWaterLevel || !CanSpreadSideways(*this, nx, y, nz)) continue;
+        if (bestLevel == -1 || candidate < bestLevel) bestLevel = candidate;
+        // kDirX[i] points from this cell to the neighbor; i^1 is the
+        // opposite direction, i.e. the neighbor flowing toward this cell.
+        if (t == BlockType::Air && (PreferredFlowDirs(*this, nx, y, nz) & (1 << (i ^ 1)))) {
+            if (acceptLevel == -1 || candidate < acceptLevel) acceptLevel = candidate;
         }
     }
 
-    bool shouldBeWater = aboveIsWater || (bestLevel != -1 && bestLevel <= kMaxWaterLevel);
+    int newLevel = (t == BlockType::Air) ? acceptLevel : bestLevel;
+    bool shouldBeWater = aboveIsWater || newLevel != -1;
 
     int cx = (int)floorf((float)x / CHUNK_SIZE);
     int cz = (int)floorf((float)z / CHUNK_SIZE);
@@ -422,7 +495,15 @@ void World::ProcessWaterCell(int x, int y, int z) {
     int lx = x - cx * CHUNK_SIZE, lz = z - cz * CHUNK_SIZE;
 
     if (shouldBeWater) {
-        unsigned char newRaw = aboveIsWater ? EncodeWaterRaw(0, true) : EncodeWaterRaw(bestLevel, false);
+        unsigned char newRaw = aboveIsWater ? EncodeWaterRaw(0, true) : EncodeWaterRaw(newLevel, false);
+        // Infinite-water rule: 2+ adjacent sources and a solid block or
+        // another source underneath turn this into a new source.
+        if (sourceNeighbors >= 2) {
+            BlockType below = GetBlock(x, y - 1, z);
+            bool belowSolid = below != BlockType::Air && below != BlockType::Water;
+            bool belowSource = below == BlockType::Water && GetWaterLevelRaw(x, y - 1, z) == 0;
+            if (belowSolid || belowSource) newRaw = EncodeWaterRaw(0, false);
+        }
         if (t == BlockType::Water && GetWaterLevelRaw(x, y, z) == newRaw) return; // unchanged
         chunk->blocks[chunk->Index(lx, y, lz)] = BlockType::Water;
         chunk->waterLevel[chunk->Index(lx, y, lz)] = newRaw;
