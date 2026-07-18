@@ -136,6 +136,11 @@ static void StartPlaying(World*& world, Player& player, int& spawnX, int& spawnZ
         player.pitch = world->GetPlayerPitch();
         if (player.pos.y < -10.0f) {
             player.pos = { (float)spawnX + 0.5f, (float)(groundY + 1), (float)spawnZ + 0.5f };
+        } else if (CheckCollision(*world, player.pos)) {
+            // Stale saved position embedded in terrain (e.g. files written
+            // before the player was ever placed): surface at the same x,z.
+            int top = world->HeightAt((int)floorf(player.pos.x), (int)floorf(player.pos.z));
+            player.pos.y = (float)(top + 1);
         }
     } else {
         player.pos = { (float)spawnX + 0.5f, (float)(groundY + 1), (float)spawnZ + 0.5f };
@@ -376,8 +381,12 @@ int main() {
                 std::string path = "saves/" + std::string(worldNameInput) + ".world";
                 currentWorldName = worldNameInput;
                 world = new World();
-                world->Save(path.c_str());
+                // Place the player before the initial save, so the file
+                // never holds a bogus (0,0,0) position if the player later
+                // quits without saving.
                 StartPlaying(world, player, spawnX, spawnZ, groundY, selected, cursorLocked, skipInput, state, currentWorldName, false);
+                world->SetPlayerState(player.pos, player.yaw, player.pitch);
+                world->Save(path.c_str());
             }
             if (!skip && mouseOverBack && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
                 skipInput = true;
